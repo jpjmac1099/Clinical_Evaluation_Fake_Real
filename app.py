@@ -10,26 +10,6 @@ import pandas as pd
 import streamlit as st
 from PIL import Image
 
-st.set_page_config(page_title="Clinician Fake/Real Classification", layout="wide")
-
-if not st.user.is_logged_in:
-    st.title("Clinician Fake/Real Classification")
-    st.write("Please sign in to access the study.")
-    if st.button("Sign in"):
-        st.login()
-    st.stop()
-
-ALLOWED_EMAILS = {
-    "jpav.freitas@gmail.org"}
-
-user_email = st.user.get("email", "").lower()
-
-if user_email not in ALLOWED_EMAILS:
-    st.error("You are signed in, but you are not authorized for this study.")
-    if st.button("Log out"):
-        st.logout()
-    st.stop()
-
 # ============================================================
 # Configuration
 # ============================================================
