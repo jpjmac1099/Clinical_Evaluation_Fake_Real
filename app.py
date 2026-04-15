@@ -225,7 +225,7 @@ st.set_page_config(page_title=APP_TITLE, layout="wide")
 init_state()
 
 st.title(APP_TITLE)
-st.caption("Upload one ZIP containing mixed/, mixed_labels.txt, and metadata_all.txt.")
+st.caption("Upload one ZIP containing the data.")
 
 with st.sidebar:
     st.header("Reader")
@@ -311,7 +311,7 @@ if idx < n_total:
         st.subheader(f"Sample {idx + 1} / {n_total}")
         st.markdown("<div style='height:120px'></div>", unsafe_allow_html=True)
         image = Image.open(image_path)
-        st.image(image, width=300)
+        st.image(image, width=180)
 
     with right:
         st.subheader("Classification")
@@ -331,6 +331,7 @@ if idx < n_total:
 
     st.stop()
 
+# End of session: SUBMIT BUTTON HERE
 st.success("Session complete.")
 st.write("Press Submit to send the results.")
 
@@ -340,14 +341,23 @@ final_df = responses_to_df()
 scores = compute_scores(final_df)
 csv_path = save_session_csv()
 
-if st.button("Submit", type="primary", disabled=st.session_state.submitted):
-    try:
-        send_email_with_csv(csv_path, scores)
-        st.session_state.submitted = True
-        st.success(f"Results sent to {RESULTS_EMAIL}")
-    except Exception as e:
-        st.error(f"Could not send email: {e}")
+submit_col1, submit_col2 = st.columns([2, 1])
 
-if st.button("Start new session"):
-    reset_session()
-    st.rerun()
+with submit_col1:
+    if st.button(
+        "Submit",
+        type="primary",
+        use_container_width=True,
+        disabled=st.session_state.submitted,
+    ):
+        try:
+            send_email_with_csv(csv_path, scores)
+            st.session_state.submitted = True
+            st.success(f"Results sent to {RESULTS_EMAIL}")
+        except Exception as e:
+            st.error(f"Could not send email: {e}")
+
+with submit_col2:
+    if st.button("Start new session", use_container_width=True):
+        reset_session()
+        st.rerun()
