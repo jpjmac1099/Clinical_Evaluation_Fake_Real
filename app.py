@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import random
 import secrets
 import smtplib
@@ -67,65 +68,78 @@ def extract_zip_to_temp(zip_file) -> Path:
     return temp_dir
 
 
-def find_required_files(base_dir: Path):
+def find_mixed_dir(base_dir: Path) -> Path:
     mixed_dirs = [p for p in base_dir.rglob("mixed") if p.is_dir()]
-    mixed_label_files = [p for p in base_dir.rglob("mixed_labels.txt") if p.is_file()]
-    metadata_files = [p for p in base_dir.rglob("metadata_all.txt") if p.is_file()]
-
     if not mixed_dirs:
         raise FileNotFoundError("Could not find a 'mixed' folder inside the ZIP.")
-    if not mixed_label_files:
-        raise FileNotFoundError("Could not find 'mixed_labels.txt' inside the ZIP.")
-    if not metadata_files:
-        raise FileNotFoundError("Could not find 'metadata_all.txt' inside the ZIP.")
-
-    return mixed_dirs[0], mixed_label_files[0], metadata_files[0]
+    return mixed_dirs[0]
 
 
-def load_dataset(mixed_dir: Path, mixed_labels_path: Path, metadata_path: Path) -> pd.DataFrame:
-    mixed_df = pd.read_csv(mixed_labels_path, sep="\t")
-    meta_df = pd.read_csv(metadata_path, sep="\t")
+def load_hidden_gt_from_secrets() -> pd.DataFrame:
+    """
+    GT is stored in Streamlit secrets and never exposed to the clinician.
+    Required columns:
+      mixed_name, true_label, label
+    """
+    if "gt" not in st.secrets or "tsv" not in st.secrets["gt"]:
+        raise RuntimeError("Missing [gt].tsv in Streamlit secrets.")
 
-    required_mixed = {"mixed_name", "true_label", "original_file"}
-    required_meta = {"saved_path", "group", "subtype", "original_patient", "source_frame"}
+    gt_tsv = st.secrets["gt"]["tsv"]
+    gt_df = pd.read_csv(io.StringIO(gt_tsv), sep="\t")
 
-    if not required_mixed.issubset(mixed_df.columns):
-        raise ValueError(f"mixed_labels.txt must contain columns: {sorted(required_mixed)}")
-    if not required_meta.issubset(meta_df.columns):
-        raise ValueError(f"metadata_all.txt must contain columns: {sorted(required_meta)}")
+    required_cols = {"mixed_name", "true_label", "label"}
+    if not required_cols.issubset(gt_df.columns):
+        raise ValueError(
+            f"GT in secrets must contain columns: {sorted(required_cols)}"
+        )
 
-    meta_df = meta_df.copy()
-    meta_df["original_file"] = meta_df["saved_path"].apply(lambda x: Path(str(x)).name)
+    gt_df = gt_df.copy()
+    gt_df["mixed_name"] = gt_df["mixed_name"].astype(str)
+    gt_df["true_label"] = gt_df["true_label"].astype(str).str.lower().str.strip()
+    gt_df["label"] = gt_df["label"].astype(str)
 
-    merged = mixed_df.merge(meta_df, on="original_file", how="left")
-    merged["image_path"] = merged["mixed_name"].apply(lambda x: str(mixed_dir / str(x)))
+    return gt_df
 
-    missing = merged[~merged["image_path"].apply(lambda p: Path(p).exists())]
+
+def load_dataset(mixed_dir: Path) -> pd.DataFrame:
+    """
+    Builds the dataset from the hidden GT + uploaded mixed images.
+    The clinician only uploads images. GT stays in secrets.
+    """
+    gt_df = load_hidden_gt_from_secrets()
+
+    gt_df["image_path"] = gt_df["mixed_name"].apply(lambda x: str(mixed_dir / str(x)))
+
+    missing = gt_df[~gt_df["image_path"].apply(lambda p: Path(p).exists())]
     if len(missing) > 0:
-        raise FileNotFoundError(f"Missing image file example: {missing.iloc[0]['image_path']}")
+        raise FileNotFoundError(
+            f"Missing image file example: {missing.iloc[0]['image_path']}"
+        )
 
     rng = random.Random(int(st.session_state.seed))
-    indices = list(merged.index)
+    indices = list(gt_df.index)
     rng.shuffle(indices)
-    merged = merged.loc[indices].reset_index(drop=True)
+    gt_df = gt_df.loc[indices].reset_index(drop=True)
 
-    return merged
+    return gt_df
 
 
 def responses_to_df() -> pd.DataFrame:
     if not st.session_state.responses:
-        return pd.DataFrame(columns=[
-            "session_uid",
-            "reader_id",
-            "reader_name",
-            "sample_idx",
-            "mixed_name",
-            "prediction",
-            "timestamp",
-            "true_label",
-            "subtype",
-            "correct",
-        ])
+        return pd.DataFrame(
+            columns=[
+                "session_uid",
+                "reader_id",
+                "reader_name",
+                "sample_idx",
+                "mixed_name",
+                "label",
+                "prediction",
+                "timestamp",
+                "true_label",
+                "correct",
+            ]
+        )
     return pd.DataFrame(st.session_state.responses)
 
 
@@ -142,16 +156,25 @@ def compute_scores(df: pd.DataFrame) -> dict:
             "overall_accuracy": 0.0,
             "total": 0,
             "correct": 0,
+            "by_label": pd.DataFrame(columns=["label", "n", "correct", "accuracy"]),
         }
 
     total = len(df)
     correct = int(df["correct"].sum())
     overall_accuracy = correct / total if total else 0.0
 
+    by_label = (
+        df.groupby("label", dropna=False)
+        .agg(n=("label", "size"), correct=("correct", "sum"))
+        .reset_index()
+    )
+    by_label["accuracy"] = by_label["correct"] / by_label["n"]
+
     return {
         "overall_accuracy": overall_accuracy,
         "total": total,
         "correct": correct,
+        "by_label": by_label,
     }
 
 
@@ -169,15 +192,27 @@ def send_email_with_csv(csv_path: Path, scores: dict):
         f"Clinician Study Results - "
         f"{st.session_state.reader_id} - {st.session_state.session_uid}"
     )
-    msg.set_content(
+
+    body = (
         f"Reader ID: {st.session_state.reader_id}\n"
         f"Reader name: {st.session_state.reader_name}\n"
         f"Session UID: {st.session_state.session_uid}\n"
-        f"Total: {scores['total']}\n"
+        f"Answered: {scores['total']}\n"
         f"Correct: {scores['correct']}\n"
         f"Accuracy: {scores['overall_accuracy']:.4f}\n"
-        f"Notes: {st.session_state.notes}\n"
+        f"Notes: {st.session_state.notes}\n\n"
+        f"Accuracy by label:\n"
     )
+
+    if not scores["by_label"].empty:
+        for _, row in scores["by_label"].iterrows():
+            body += (
+                f"- {row['label']}: "
+                f"{int(row['correct'])}/{int(row['n'])} "
+                f"({row['accuracy']:.4f})\n"
+            )
+
+    msg.set_content(body)
 
     with open(csv_path, "rb") as f:
         csv_data = f.read()
@@ -195,13 +230,21 @@ def send_email_with_csv(csv_path: Path, scores: dict):
         server.send_message(msg)
 
 
+def submit_results():
+    final_df = responses_to_df()
+    scores = compute_scores(final_df)
+    csv_path = save_session_csv()
+    send_email_with_csv(csv_path, scores)
+    st.session_state.submitted = True
+
+
 def record_answer(prediction: str):
     df = st.session_state.dataset
     idx = st.session_state.current_idx
     row = df.iloc[idx]
 
     true_label = str(row["true_label"]).strip().lower()
-    subtype = row.get("subtype", "unknown")
+    label = str(row["label"]).strip()
     correct = prediction == true_label
 
     response = {
@@ -210,10 +253,10 @@ def record_answer(prediction: str):
         "reader_name": st.session_state.reader_name,
         "sample_idx": idx,
         "mixed_name": row["mixed_name"],
+        "label": label,
         "prediction": prediction,
         "timestamp": datetime.now().isoformat(),
         "true_label": true_label,
-        "subtype": subtype,
         "correct": bool(correct),
     }
 
@@ -225,7 +268,7 @@ st.set_page_config(page_title=APP_TITLE, layout="wide")
 init_state()
 
 st.title(APP_TITLE)
-st.caption("Upload one ZIP containing the data.")
+st.caption("Upload one ZIP containing only the mixed/ folder images.")
 
 with st.sidebar:
     st.header("Reader")
@@ -250,7 +293,7 @@ with st.sidebar:
 st.subheader("1. Upload study package")
 
 uploaded_zip = st.file_uploader(
-    "Upload one ZIP with mixed/, mixed_labels.txt, and metadata_all.txt",
+    "Upload one ZIP with the mixed/ folder only",
     type=["zip"],
 )
 
@@ -262,8 +305,8 @@ if not st.session_state.setup_done:
 
         try:
             temp_dir = extract_zip_to_temp(uploaded_zip)
-            mixed_dir, mixed_labels_path, metadata_path = find_required_files(temp_dir)
-            dataset = load_dataset(mixed_dir, mixed_labels_path, metadata_path)
+            mixed_dir = find_mixed_dir(temp_dir)
+            dataset = load_dataset(mixed_dir)
 
             st.session_state.working_dir = str(temp_dir)
             st.session_state.dataset = dataset
@@ -282,9 +325,10 @@ df = st.session_state.dataset
 n_total = len(df)
 answered = len(st.session_state.responses)
 
-c1, c2 = st.columns(2)
-c1.metric("Total samples", n_total)
-c2.metric("Answered", answered)
+top1, top2, top3 = st.columns([1, 1, 1])
+top1.metric("Total samples", n_total)
+top2.metric("Answered", answered)
+top3.metric("Remaining", n_total - answered)
 
 st.progress(answered / n_total if n_total else 0.0)
 
@@ -311,7 +355,7 @@ if idx < n_total:
         st.subheader(f"Sample {idx + 1} / {n_total}")
         st.markdown("<div style='height:120px'></div>", unsafe_allow_html=True)
         image = Image.open(image_path)
-        st.image(image, width=180)
+        st.image(image, width=300)
 
     with right:
         st.subheader("Classification")
@@ -329,35 +373,40 @@ if idx < n_total:
                 record_answer("fake")
                 st.rerun()
 
+        st.markdown("---")
+
+        if st.button(
+            "Submit now",
+            use_container_width=True,
+            disabled=answered == 0 or st.session_state.submitted,
+        ):
+            try:
+                submit_results()
+                st.success(f"Results sent to {RESULTS_EMAIL}")
+            except Exception as e:
+                st.error(f"Could not send email: {e}")
+
     st.stop()
 
-# End of session: SUBMIT BUTTON HERE
 st.success("Session complete.")
-st.write("Press Submit to send the results.")
-
 st.session_state.notes = st.text_area("Optional notes", value=st.session_state.notes)
 
-final_df = responses_to_df()
-scores = compute_scores(final_df)
-csv_path = save_session_csv()
+bottom1, bottom2 = st.columns([2, 1])
 
-submit_col1, submit_col2 = st.columns([2, 1])
-
-with submit_col1:
+with bottom1:
     if st.button(
         "Submit",
         type="primary",
         use_container_width=True,
-        disabled=st.session_state.submitted,
+        disabled=answered == 0 or st.session_state.submitted,
     ):
         try:
-            send_email_with_csv(csv_path, scores)
-            st.session_state.submitted = True
+            submit_results()
             st.success(f"Results sent to {RESULTS_EMAIL}")
         except Exception as e:
             st.error(f"Could not send email: {e}")
 
-with submit_col2:
+with bottom2:
     if st.button("Start new session", use_container_width=True):
         reset_session()
         st.rerun()
