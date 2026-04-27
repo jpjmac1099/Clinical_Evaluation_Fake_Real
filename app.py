@@ -159,48 +159,55 @@ def load_dataset(
     mixed_dir: Path,
     evaluation_type: str,
     uploaded_zip_name: str = "",
-) -> pd.DataFrame:
+    ) -> pd.DataFrame:
+
     gt_df = load_hidden_gt_from_secrets()
 
     detected_view = detect_view_from_name(uploaded_zip_name)
     if detected_view == "unknown":
         detected_view = detect_view_from_name(str(mixed_dir))
 
-    gt_df["label"] = detected_view
+    allowed_exts = IMAGE_EXTS if evaluation_type == "frames" else VIDEO_EXTS
 
+    # 👉 STEP 1: list actual files in folder
+    files = [
+        p for p in mixed_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in allowed_exts
+    ]
+
+    if len(files) == 0:
+        raise RuntimeError(f"No {evaluation_type} files found in {mixed_dir}")
+
+    # 👉 STEP 2: build dataset from files
     rows = []
+    for p in files:
+        stem = p.stem
 
-    for _, row in gt_df.iterrows():
-        try:
-            media_path = find_media_file_by_stem(
-                mixed_dir=mixed_dir,
-                mixed_name=row["mixed_name"],
-                evaluation_type=evaluation_type,
-            )
+        # match GT by stem
+        match = gt_df[gt_df["mixed_name"].str.contains(stem)]
 
-            row = row.copy()
-            row["media_path"] = str(media_path)
-            row["displayed_file"] = media_path.name
-            rows.append(row)
-
-        except FileNotFoundError:
+        if len(match) == 0:
             continue
 
+        row = match.iloc[0].copy()
+        row["media_path"] = str(p)
+        row["displayed_file"] = p.name
+        row["label"] = detected_view
+
+        rows.append(row)
+
     if len(rows) == 0:
-        raise FileNotFoundError(
-            f"No matching files found in {evaluation_type} mode inside {mixed_dir}"
-        )
+        raise RuntimeError("No matching GT entries found for files")
 
-    gt_df = pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
 
+    # 👉 STEP 3: shuffle ONLY actual files
     rng = random.Random(int(st.session_state.seed))
-    indices = list(gt_df.index)
-    rng.shuffle(indices)
-    gt_df = gt_df.loc[indices].reset_index(drop=True)
+    df = df.sample(frac=1, random_state=rng.randint(0, 10**6)).reset_index(drop=True)
 
     st.session_state.detected_view = detected_view
 
-    return gt_df
+    return df
 
 def responses_to_df() -> pd.DataFrame:
     if not st.session_state.responses:
