@@ -40,6 +40,8 @@ def init_state():
         "setup_done": False,
         "submitted": False,
         "evaluation_type": "frames",
+        "uploaded_zip_name": "",
+        "detected_view": "unknown",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -58,6 +60,27 @@ def reset_session():
     st.session_state.setup_done = False
     st.session_state.submitted = False
     st.session_state.evaluation_type = "frames"
+    st.session_state.uploaded_zip_name = ""
+    st.session_state.detected_view = "unknown"
+
+
+def detect_view_from_name(name: str) -> str:
+    name = str(name).lower()
+
+    view_patterns = {
+        "A4C": ["a4c", "4ch", "4_ch", "4-ch"],
+        "A3C": ["a3c", "3ch", "3_ch", "3-ch"],
+        "A5C": ["a5c", "5ch", "5_ch", "5-ch"],
+        "A2C": ["a2c", "2ch", "2_ch", "2-ch"],
+        "PSAX": ["psax"],
+        "PLAX": ["plax"],
+    }
+
+    for view, patterns in view_patterns.items():
+        if any(p in name for p in patterns):
+            return view
+
+    return "unknown"
 
 
 def extract_zip_to_temp(zip_file) -> Path:
@@ -85,16 +108,12 @@ def load_hidden_gt_from_secrets() -> pd.DataFrame:
     GT is stored in Streamlit secrets and never exposed to the clinician.
 
     Required columns:
-        mixed_name, true_label, label
+        mixed_name, true_label, original_file
 
-    Example:
-        mixed_name      true_label      label
-        sample_0000.png fake            4CH
-        sample_0001.png real            PLAX
+    Optional columns:
+        method
 
-    For video mode:
-        mixed_name      true_label      label
-        sample_0000.mp4 fake            4CH
+    View/label is detected automatically from uploaded ZIP/folder name.
     """
     if "gt" not in st.secrets or "tsv" not in st.secrets["gt"]:
         raise RuntimeError("Missing [gt].tsv in Streamlit secrets.")
@@ -102,7 +121,7 @@ def load_hidden_gt_from_secrets() -> pd.DataFrame:
     gt_tsv = st.secrets["gt"]["tsv"]
     gt_df = pd.read_csv(io.StringIO(gt_tsv), sep="\t")
 
-    required_cols = {"mixed_name", "true_label", "label"}
+    required_cols = {"mixed_name", "true_label", "original_file"}
     if not required_cols.issubset(gt_df.columns):
         raise ValueError(
             f"GT in secrets must contain columns: {sorted(required_cols)}"
@@ -111,43 +130,80 @@ def load_hidden_gt_from_secrets() -> pd.DataFrame:
     gt_df = gt_df.copy()
     gt_df["mixed_name"] = gt_df["mixed_name"].astype(str).str.strip()
     gt_df["true_label"] = gt_df["true_label"].astype(str).str.lower().str.strip()
-    gt_df["label"] = gt_df["label"].astype(str).str.strip()
+    gt_df["original_file"] = gt_df["original_file"].astype(str).str.strip()
+
+    if "method" not in gt_df.columns:
+        gt_df["method"] = gt_df["true_label"]
+    else:
+        gt_df["method"] = gt_df["method"].astype(str).str.strip()
 
     return gt_df
 
 
-def load_dataset(mixed_dir: Path, evaluation_type: str) -> pd.DataFrame:
+def find_media_file_by_stem(mixed_dir: Path, mixed_name: str, evaluation_type: str) -> Path:
     """
-    Builds the dataset from hidden GT + uploaded mixed media.
-    The clinician uploads only the mixed/ folder ZIP.
+    Same GT works for frames/videos:
+      sample_0000.png -> sample_0000.png in frame mode
+      sample_0000.png -> sample_0000.mp4 in video mode
     """
-    gt_df = load_hidden_gt_from_secrets()
-
-    gt_df["media_path"] = gt_df["mixed_name"].apply(
-        lambda x: str(mixed_dir / str(x))
-    )
-
+    stem = Path(str(mixed_name)).stem
     allowed_exts = IMAGE_EXTS if evaluation_type == "frames" else VIDEO_EXTS
 
-    missing = gt_df[~gt_df["media_path"].apply(lambda p: Path(p).exists())]
-    if len(missing) > 0:
+    matches = [
+        p for p in mixed_dir.iterdir()
+        if p.is_file()
+        and p.stem == stem
+        and p.suffix.lower() in allowed_exts
+    ]
+
+    if len(matches) == 0:
         raise FileNotFoundError(
-            f"Missing media file example: {missing.iloc[0]['media_path']}"
+            f"Could not find media for {mixed_name} in {evaluation_type} mode. "
+            f"Expected stem: {stem}"
         )
 
-    wrong_ext = gt_df[
-        ~gt_df["media_path"].apply(lambda p: Path(p).suffix.lower() in allowed_exts)
-    ]
-    if len(wrong_ext) > 0:
-        raise ValueError(
-            f"Some files do not match {evaluation_type} mode. "
-            f"Example: {wrong_ext.iloc[0]['media_path']}"
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"Multiple files found for stem {stem}: {[m.name for m in matches]}"
         )
+
+    return matches[0]
+
+
+def load_dataset(
+    mixed_dir: Path,
+    evaluation_type: str,
+    uploaded_zip_name: str = "",
+) -> pd.DataFrame:
+    gt_df = load_hidden_gt_from_secrets()
+
+    detected_view = detect_view_from_name(uploaded_zip_name)
+    if detected_view == "unknown":
+        detected_view = detect_view_from_name(str(mixed_dir))
+
+    gt_df["label"] = detected_view
+
+    media_paths = []
+    displayed_files = []
+
+    for mixed_name in gt_df["mixed_name"]:
+        media_path = find_media_file_by_stem(
+            mixed_dir=mixed_dir,
+            mixed_name=mixed_name,
+            evaluation_type=evaluation_type,
+        )
+        media_paths.append(str(media_path))
+        displayed_files.append(media_path.name)
+
+    gt_df["media_path"] = media_paths
+    gt_df["displayed_file"] = displayed_files
 
     rng = random.Random(int(st.session_state.seed))
     indices = list(gt_df.index)
     rng.shuffle(indices)
     gt_df = gt_df.loc[indices].reset_index(drop=True)
+
+    st.session_state.detected_view = detected_view
 
     return gt_df
 
@@ -160,9 +216,13 @@ def responses_to_df() -> pd.DataFrame:
                 "reader_id",
                 "reader_name",
                 "evaluation_type",
+                "detected_view",
                 "sample_idx",
                 "mixed_name",
+                "displayed_file",
+                "original_file",
                 "label",
+                "method",
                 "prediction",
                 "timestamp",
                 "true_label",
@@ -176,7 +236,8 @@ def responses_to_df() -> pd.DataFrame:
 def save_session_csv() -> Path:
     safe_reader = (st.session_state.reader_id or "reader").replace(" ", "_")
     mode = st.session_state.evaluation_type
-    out = RESULTS_DIR / f"responses_{mode}_{safe_reader}_{st.session_state.session_uid}.csv"
+    view = st.session_state.detected_view
+    out = RESULTS_DIR / f"responses_{mode}_{view}_{safe_reader}_{st.session_state.session_uid}.csv"
     responses_to_df().to_csv(out, index=False)
     return out
 
@@ -188,6 +249,7 @@ def compute_scores(df: pd.DataFrame) -> dict:
             "total": 0,
             "correct": 0,
             "by_label": pd.DataFrame(columns=["label", "n", "correct", "accuracy"]),
+            "by_method": pd.DataFrame(columns=["method", "n", "correct", "accuracy"]),
         }
 
     total = len(df)
@@ -201,11 +263,19 @@ def compute_scores(df: pd.DataFrame) -> dict:
     )
     by_label["accuracy"] = by_label["correct"] / by_label["n"]
 
+    by_method = (
+        df.groupby("method", dropna=False)
+        .agg(n=("method", "size"), correct=("correct", "sum"))
+        .reset_index()
+    )
+    by_method["accuracy"] = by_method["correct"] / by_method["n"]
+
     return {
         "overall_accuracy": overall_accuracy,
         "total": total,
         "correct": correct,
         "by_label": by_label,
+        "by_method": by_method,
     }
 
 
@@ -222,12 +292,14 @@ def send_email_with_csv(csv_path: Path, scores: dict):
     msg["Subject"] = (
         f"Clinician Study Results - "
         f"{st.session_state.evaluation_type} - "
+        f"{st.session_state.detected_view} - "
         f"{st.session_state.reader_id} - "
         f"{st.session_state.session_uid}"
     )
 
     body = (
         f"Evaluation type: {st.session_state.evaluation_type}\n"
+        f"Detected view: {st.session_state.detected_view}\n"
         f"Reader ID: {st.session_state.reader_id}\n"
         f"Reader name: {st.session_state.reader_name}\n"
         f"Session UID: {st.session_state.session_uid}\n"
@@ -235,13 +307,22 @@ def send_email_with_csv(csv_path: Path, scores: dict):
         f"Correct: {scores['correct']}\n"
         f"Accuracy: {scores['overall_accuracy']:.4f}\n"
         f"Notes: {st.session_state.notes}\n\n"
-        f"Accuracy by label:\n"
+        f"Accuracy by view/label:\n"
     )
 
     if not scores["by_label"].empty:
         for _, row in scores["by_label"].iterrows():
             body += (
                 f"- {row['label']}: "
+                f"{int(row['correct'])}/{int(row['n'])} "
+                f"({row['accuracy']:.4f})\n"
+            )
+
+    body += "\nAccuracy by method:\n"
+    if not scores["by_method"].empty:
+        for _, row in scores["by_method"].iterrows():
+            body += (
+                f"- {row['method']}: "
                 f"{int(row['correct'])}/{int(row['n'])} "
                 f"({row['accuracy']:.4f})\n"
             )
@@ -278,7 +359,6 @@ def record_answer(prediction: str):
     row = df.iloc[idx]
 
     true_label = str(row["true_label"]).strip().lower()
-    label = str(row["label"]).strip()
     correct = prediction == true_label
 
     response = {
@@ -286,9 +366,13 @@ def record_answer(prediction: str):
         "reader_id": st.session_state.reader_id,
         "reader_name": st.session_state.reader_name,
         "evaluation_type": st.session_state.evaluation_type,
+        "detected_view": st.session_state.detected_view,
         "sample_idx": idx,
         "mixed_name": row["mixed_name"],
-        "label": label,
+        "displayed_file": row["displayed_file"],
+        "original_file": row["original_file"],
+        "label": row["label"],
+        "method": row["method"],
         "prediction": prediction,
         "timestamp": datetime.now().isoformat(),
         "true_label": true_label,
@@ -299,9 +383,6 @@ def record_answer(prediction: str):
     st.session_state.current_idx += 1
 
 
-# ============================================================
-# UI
-# ============================================================
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 init_state()
 
@@ -324,6 +405,7 @@ with st.sidebar:
     )
 
     st.caption(f"Automatic session seed: {st.session_state.seed}")
+    st.caption(f"Detected view: {st.session_state.detected_view}")
     st.caption(f"Results destination: {RESULTS_EMAIL}")
 
     st.markdown("---")
@@ -357,19 +439,25 @@ if not st.session_state.setup_done:
             st.stop()
 
         try:
+            st.session_state.uploaded_zip_name = uploaded_zip.name
+
             temp_dir = extract_zip_to_temp(uploaded_zip)
             mixed_dir = find_mixed_dir(temp_dir)
 
             dataset = load_dataset(
                 mixed_dir=mixed_dir,
                 evaluation_type=st.session_state.evaluation_type,
+                uploaded_zip_name=uploaded_zip.name,
             )
 
             st.session_state.working_dir = str(temp_dir)
             st.session_state.dataset = dataset
             st.session_state.setup_done = True
 
-            st.success(f"Loaded {len(dataset)} samples.")
+            st.success(
+                f"Loaded {len(dataset)} samples. "
+                f"Detected view: {st.session_state.detected_view}"
+            )
             st.rerun()
 
         except Exception as e:
@@ -466,9 +554,6 @@ if idx < n_total:
     st.stop()
 
 
-# ============================================================
-# End of session
-# ============================================================
 st.success("Session complete.")
 
 st.session_state.notes = st.text_area(
