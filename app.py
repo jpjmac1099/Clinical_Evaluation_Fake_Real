@@ -104,17 +104,6 @@ def find_mixed_dir(base_dir: Path) -> Path:
 
 
 def load_hidden_gt_from_secrets() -> pd.DataFrame:
-    """
-    GT is stored in Streamlit secrets and never exposed to the clinician.
-
-    Required columns:
-        mixed_name, true_label, original_file
-
-    Optional columns:
-        method
-
-    View/label is detected automatically from uploaded ZIP/folder name.
-    """
     if "gt" not in st.secrets or "tsv" not in st.secrets["gt"]:
         raise RuntimeError("Missing [gt].tsv in Streamlit secrets.")
 
@@ -141,11 +130,6 @@ def load_hidden_gt_from_secrets() -> pd.DataFrame:
 
 
 def find_media_file_by_stem(mixed_dir: Path, mixed_name: str, evaluation_type: str) -> Path:
-    """
-    Same GT works for frames/videos:
-      sample_0000.png -> sample_0000.png in frame mode
-      sample_0000.png -> sample_0000.mp4 in video mode
-    """
     stem = Path(str(mixed_name)).stem
     allowed_exts = IMAGE_EXTS if evaluation_type == "frames" else VIDEO_EXTS
 
@@ -383,6 +367,32 @@ def record_answer(prediction: str):
     st.session_state.current_idx += 1
 
 
+def show_media(media_path: Path):
+    """
+    Robust display for frames/videos.
+    For videos, read bytes and pass bytes to st.video().
+    This avoids path/temporary-file issues on Streamlit Cloud.
+    """
+    if st.session_state.evaluation_type == "frames":
+        image = Image.open(media_path)
+        st.image(image, width=300)
+    else:
+        with open(media_path, "rb") as f:
+            video_bytes = f.read()
+
+        st.video(
+            video_bytes,
+            format="video/mp4",
+            start_time=0,
+            autoplay=False,
+            loop=False,
+            muted=True,
+        )
+
+
+# ============================================================
+# UI
+# ============================================================
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 init_state()
 
@@ -505,19 +515,7 @@ if idx < n_total:
     with left:
         st.subheader(f"Sample {idx + 1} / {n_total}")
         st.markdown("<div style='height:120px'></div>", unsafe_allow_html=True)
-
-        if st.session_state.evaluation_type == "frames":
-            image = Image.open(media_path)
-            st.image(image, width=200)
-        else:
-            st.video(
-                str(media_path),
-                format="video/mp4",
-                start_time=0,
-                autoplay=False,
-                loop=False,
-                muted=True,
-            )
+        show_media(media_path)
 
     with right:
         st.subheader("Classification")
