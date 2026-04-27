@@ -379,7 +379,6 @@ def record_answer(prediction: str):
 
 def show_media(media_path: Path):
     DISPLAY_WIDTH = 200
-    DISPLAY_HEIGHT = 200
 
     if st.session_state.evaluation_type == "frames":
         image = Image.open(media_path)
@@ -391,26 +390,14 @@ def show_media(media_path: Path):
 
         video_base64 = base64.b64encode(video_bytes).decode()
 
-        html = f"""
-        <html>
-        <body style="margin:0; padding:0; display:flex; justify-content:center; align-items:center;">
-            <video
-                width="{DISPLAY_WIDTH}"
-                height="{DISPLAY_HEIGHT}"
-                controls
-                muted
-                style="width:{DISPLAY_WIDTH}px; height:{DISPLAY_HEIGHT}px; object-fit:contain;"
-            >
+        components.html(
+            f"""
+            <video width="{DISPLAY_WIDTH}" controls muted style="width:{DISPLAY_WIDTH}px; height:auto;">
                 <source src="data:video/mp4;base64,{video_base64}" type="video/mp4">
             </video>
-        </body>
-        </html>
-        """
-
-        components.html(
-            html,
-            width=DISPLAY_WIDTH + 20,
-            height=DISPLAY_HEIGHT + 40,
+            """,
+            width=DISPLAY_WIDTH,
+            height=DISPLAY_WIDTH + 40,
             scrolling=False,
         )
 
@@ -534,13 +521,12 @@ if idx < n_total:
     row = df.iloc[idx]
     media_path = Path(row["media_path"])
 
-    left, right = st.columns([3, 1])
+    left, right = st.columns([0.35, 1.65])
 
     with left:
         st.subheader(f"Sample {idx + 1} / {n_total}")
-        st.markdown("<div style='height:120px'></div>", unsafe_allow_html=True)
         show_media(media_path)
-
+    
     with right:
         st.subheader("Classification")
         st.write(f"Reader ID: **{st.session_state.reader_id}**")
