@@ -21,6 +21,9 @@ RESULTS_EMAIL = "jpav.freitas@gmail.com"
 RESULTS_DIR = Path("results")
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+
 
 def init_state():
     defaults = {
@@ -36,6 +39,7 @@ def init_state():
         "session_uid": datetime.now().strftime("%Y%m%d_%H%M%S"),
         "setup_done": False,
         "submitted": False,
+        "evaluation_type": "frames",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -53,6 +57,7 @@ def reset_session():
     st.session_state.session_uid = datetime.now().strftime("%Y%m%d_%H%M%S")
     st.session_state.setup_done = False
     st.session_state.submitted = False
+    st.session_state.evaluation_type = "frames"
 
 
 def extract_zip_to_temp(zip_file) -> Path:
@@ -78,8 +83,18 @@ def find_mixed_dir(base_dir: Path) -> Path:
 def load_hidden_gt_from_secrets() -> pd.DataFrame:
     """
     GT is stored in Streamlit secrets and never exposed to the clinician.
+
     Required columns:
-      mixed_name, true_label, label
+        mixed_name, true_label, label
+
+    Example:
+        mixed_name      true_label      label
+        sample_0000.png fake            4CH
+        sample_0001.png real            PLAX
+
+    For video mode:
+        mixed_name      true_label      label
+        sample_0000.mp4 fake            4CH
     """
     if "gt" not in st.secrets or "tsv" not in st.secrets["gt"]:
         raise RuntimeError("Missing [gt].tsv in Streamlit secrets.")
@@ -94,26 +109,39 @@ def load_hidden_gt_from_secrets() -> pd.DataFrame:
         )
 
     gt_df = gt_df.copy()
-    gt_df["mixed_name"] = gt_df["mixed_name"].astype(str)
+    gt_df["mixed_name"] = gt_df["mixed_name"].astype(str).str.strip()
     gt_df["true_label"] = gt_df["true_label"].astype(str).str.lower().str.strip()
-    gt_df["label"] = gt_df["label"].astype(str)
+    gt_df["label"] = gt_df["label"].astype(str).str.strip()
 
     return gt_df
 
 
-def load_dataset(mixed_dir: Path) -> pd.DataFrame:
+def load_dataset(mixed_dir: Path, evaluation_type: str) -> pd.DataFrame:
     """
-    Builds the dataset from the hidden GT + uploaded mixed images.
-    The clinician only uploads images. GT stays in secrets.
+    Builds the dataset from hidden GT + uploaded mixed media.
+    The clinician uploads only the mixed/ folder ZIP.
     """
     gt_df = load_hidden_gt_from_secrets()
 
-    gt_df["image_path"] = gt_df["mixed_name"].apply(lambda x: str(mixed_dir / str(x)))
+    gt_df["media_path"] = gt_df["mixed_name"].apply(
+        lambda x: str(mixed_dir / str(x))
+    )
 
-    missing = gt_df[~gt_df["image_path"].apply(lambda p: Path(p).exists())]
+    allowed_exts = IMAGE_EXTS if evaluation_type == "frames" else VIDEO_EXTS
+
+    missing = gt_df[~gt_df["media_path"].apply(lambda p: Path(p).exists())]
     if len(missing) > 0:
         raise FileNotFoundError(
-            f"Missing image file example: {missing.iloc[0]['image_path']}"
+            f"Missing media file example: {missing.iloc[0]['media_path']}"
+        )
+
+    wrong_ext = gt_df[
+        ~gt_df["media_path"].apply(lambda p: Path(p).suffix.lower() in allowed_exts)
+    ]
+    if len(wrong_ext) > 0:
+        raise ValueError(
+            f"Some files do not match {evaluation_type} mode. "
+            f"Example: {wrong_ext.iloc[0]['media_path']}"
         )
 
     rng = random.Random(int(st.session_state.seed))
@@ -131,6 +159,7 @@ def responses_to_df() -> pd.DataFrame:
                 "session_uid",
                 "reader_id",
                 "reader_name",
+                "evaluation_type",
                 "sample_idx",
                 "mixed_name",
                 "label",
@@ -140,12 +169,14 @@ def responses_to_df() -> pd.DataFrame:
                 "correct",
             ]
         )
+
     return pd.DataFrame(st.session_state.responses)
 
 
 def save_session_csv() -> Path:
     safe_reader = (st.session_state.reader_id or "reader").replace(" ", "_")
-    out = RESULTS_DIR / f"responses_{safe_reader}_{st.session_state.session_uid}.csv"
+    mode = st.session_state.evaluation_type
+    out = RESULTS_DIR / f"responses_{mode}_{safe_reader}_{st.session_state.session_uid}.csv"
     responses_to_df().to_csv(out, index=False)
     return out
 
@@ -190,10 +221,13 @@ def send_email_with_csv(csv_path: Path, scores: dict):
     msg["To"] = RESULTS_EMAIL
     msg["Subject"] = (
         f"Clinician Study Results - "
-        f"{st.session_state.reader_id} - {st.session_state.session_uid}"
+        f"{st.session_state.evaluation_type} - "
+        f"{st.session_state.reader_id} - "
+        f"{st.session_state.session_uid}"
     )
 
     body = (
+        f"Evaluation type: {st.session_state.evaluation_type}\n"
         f"Reader ID: {st.session_state.reader_id}\n"
         f"Reader name: {st.session_state.reader_name}\n"
         f"Session UID: {st.session_state.session_uid}\n"
@@ -251,6 +285,7 @@ def record_answer(prediction: str):
         "session_uid": st.session_state.session_uid,
         "reader_id": st.session_state.reader_id,
         "reader_name": st.session_state.reader_name,
+        "evaluation_type": st.session_state.evaluation_type,
         "sample_idx": idx,
         "mixed_name": row["mixed_name"],
         "label": label,
@@ -264,31 +299,49 @@ def record_answer(prediction: str):
     st.session_state.current_idx += 1
 
 
+# ============================================================
+# UI
+# ============================================================
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 init_state()
 
 st.title(APP_TITLE)
-st.caption("Upload one ZIP containing only the mixed/ folder images.")
+st.caption("Upload one ZIP containing only the mixed/ folder.")
 
 with st.sidebar:
     st.header("Reader")
+
     st.session_state.reader_id = st.text_input(
         "Reader ID",
         value=st.session_state.reader_id,
         placeholder="reader_01",
     )
+
     st.session_state.reader_name = st.text_input(
         "Reader name",
         value=st.session_state.reader_name,
         placeholder="Dr. Name",
     )
+
     st.caption(f"Automatic session seed: {st.session_state.seed}")
     st.caption(f"Results destination: {RESULTS_EMAIL}")
 
     st.markdown("---")
+
     if st.button("Reset app"):
         reset_session()
         st.rerun()
+
+
+st.subheader("0. Select evaluation type")
+
+st.session_state.evaluation_type = st.radio(
+    "Evaluation type",
+    options=["frames", "videos"],
+    format_func=lambda x: "Frames evaluation" if x == "frames" else "Video evaluation",
+    horizontal=True,
+    disabled=st.session_state.setup_done,
+)
 
 st.subheader("1. Upload study package")
 
@@ -306,20 +359,27 @@ if not st.session_state.setup_done:
         try:
             temp_dir = extract_zip_to_temp(uploaded_zip)
             mixed_dir = find_mixed_dir(temp_dir)
-            dataset = load_dataset(mixed_dir)
+
+            dataset = load_dataset(
+                mixed_dir=mixed_dir,
+                evaluation_type=st.session_state.evaluation_type,
+            )
 
             st.session_state.working_dir = str(temp_dir)
             st.session_state.dataset = dataset
             st.session_state.setup_done = True
+
             st.success(f"Loaded {len(dataset)} samples.")
             st.rerun()
+
         except Exception as e:
             st.error(f"Failed to load uploaded ZIP: {e}")
             st.stop()
 
 if not st.session_state.setup_done:
-    st.info("Upload the ZIP and click 'Load uploaded ZIP'.")
+    st.info("Choose the evaluation type, upload the ZIP, then click 'Load uploaded ZIP'.")
     st.stop()
+
 
 df = st.session_state.dataset
 n_total = len(df)
@@ -334,6 +394,7 @@ st.progress(answered / n_total if n_total else 0.0)
 
 if not st.session_state.started:
     st.subheader("2. Start session")
+
     if st.button(
         "Start classification",
         type="primary",
@@ -341,33 +402,49 @@ if not st.session_state.started:
     ):
         st.session_state.started = True
         st.rerun()
+
     st.stop()
+
 
 idx = st.session_state.current_idx
 
 if idx < n_total:
     row = df.iloc[idx]
-    image_path = Path(row["image_path"])
+    media_path = Path(row["media_path"])
 
     left, right = st.columns([3, 1])
 
     with left:
         st.subheader(f"Sample {idx + 1} / {n_total}")
         st.markdown("<div style='height:120px'></div>", unsafe_allow_html=True)
-        image = Image.open(image_path)
-        st.image(image, width=300)
+
+        if st.session_state.evaluation_type == "frames":
+            image = Image.open(media_path)
+            st.image(image, width=300)
+        else:
+            st.video(
+                str(media_path),
+                format="video/mp4",
+                start_time=0,
+                autoplay=False,
+                loop=False,
+                muted=True,
+            )
 
     with right:
         st.subheader("Classification")
         st.write(f"Reader ID: **{st.session_state.reader_id}**")
+
         if st.session_state.reader_name.strip():
             st.write(f"Reader name: **{st.session_state.reader_name}**")
 
         col_real, col_fake = st.columns(2)
+
         with col_real:
             if st.button("Real", use_container_width=True, type="primary"):
                 record_answer("real")
                 st.rerun()
+
         with col_fake:
             if st.button("Fake", use_container_width=True):
                 record_answer("fake")
@@ -388,8 +465,16 @@ if idx < n_total:
 
     st.stop()
 
+
+# ============================================================
+# End of session
+# ============================================================
 st.success("Session complete.")
-st.session_state.notes = st.text_area("Optional notes", value=st.session_state.notes)
+
+st.session_state.notes = st.text_area(
+    "Optional notes",
+    value=st.session_state.notes,
+)
 
 bottom1, bottom2 = st.columns([2, 1])
 
