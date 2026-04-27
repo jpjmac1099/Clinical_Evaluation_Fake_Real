@@ -508,7 +508,7 @@ if idx < n_total:
 
         if st.session_state.evaluation_type == "frames":
             image = Image.open(media_path)
-            st.image(image, width=300)
+            st.image(image, width=200)
         else:
             st.video(
                 str(media_path),
