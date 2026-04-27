@@ -377,14 +377,32 @@ def record_answer(prediction: str):
 
 def show_media(media_path: Path):
     """
-    Robust display for frames/videos.
-    For videos, read bytes and pass bytes to st.video().
-    This avoids path/temporary-file issues on Streamlit Cloud.
+    Unified media display for frames/videos.
+    Keeps images and videos visually the same size.
     """
+    DISPLAY_WIDTH = 200
+
     if st.session_state.evaluation_type == "frames":
         image = Image.open(media_path)
-        st.image(image, width=200)
+        st.image(image, width=DISPLAY_WIDTH)
+
     else:
+        # CSS must be defined before st.video
+        st.markdown(
+            f"""
+            <style>
+            div[data-testid="stVideo"] video {{
+                width: {DISPLAY_WIDTH}px !important;
+                height: auto !important;
+                display: block;
+                margin-left: auto;
+                margin-right: auto;
+            }}
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
         with open(media_path, "rb") as f:
             video_bytes = f.read()
 
@@ -396,7 +414,6 @@ def show_media(media_path: Path):
             loop=False,
             muted=True,
         )
-
 
 # ============================================================
 # UI
