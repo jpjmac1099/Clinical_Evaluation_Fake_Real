@@ -153,7 +153,6 @@ def find_media_file_by_stem(mixed_dir: Path, mixed_name: str, evaluation_type: s
 
     return matches[0]
 
-
 def load_dataset(
     mixed_dir: Path,
     evaluation_type: str,
@@ -167,20 +166,30 @@ def load_dataset(
 
     gt_df["label"] = detected_view
 
-    media_paths = []
-    displayed_files = []
+    rows = []
 
-    for mixed_name in gt_df["mixed_name"]:
-        media_path = find_media_file_by_stem(
-            mixed_dir=mixed_dir,
-            mixed_name=mixed_name,
-            evaluation_type=evaluation_type,
+    for _, row in gt_df.iterrows():
+        try:
+            media_path = find_media_file_by_stem(
+                mixed_dir=mixed_dir,
+                mixed_name=row["mixed_name"],
+                evaluation_type=evaluation_type,
+            )
+
+            row = row.copy()
+            row["media_path"] = str(media_path)
+            row["displayed_file"] = media_path.name
+            rows.append(row)
+
+        except FileNotFoundError:
+            continue
+
+    if len(rows) == 0:
+        raise FileNotFoundError(
+            f"No matching files found in {evaluation_type} mode inside {mixed_dir}"
         )
-        media_paths.append(str(media_path))
-        displayed_files.append(media_path.name)
 
-    gt_df["media_path"] = media_paths
-    gt_df["displayed_file"] = displayed_files
+    gt_df = pd.DataFrame(rows)
 
     rng = random.Random(int(st.session_state.seed))
     indices = list(gt_df.index)
@@ -190,7 +199,6 @@ def load_dataset(
     st.session_state.detected_view = detected_view
 
     return gt_df
-
 
 def responses_to_df() -> pd.DataFrame:
     if not st.session_state.responses:
@@ -352,14 +360,14 @@ def record_answer(prediction: str):
         "evaluation_type": st.session_state.evaluation_type,
         "detected_view": st.session_state.detected_view,
         "sample_idx": idx,
-        "mixed_name": row["mixed_name"],
-        "displayed_file": row["displayed_file"],
-        "original_file": row["original_file"],
-        "label": row["label"],
-        "method": row["method"],
+        "mixed_name": str(row.get("mixed_name", "")),
+        "displayed_file": str(row.get("displayed_file", "")),
+        "original_file": str(row.get("original_file", "")),
+        "label": str(row.get("label", st.session_state.detected_view)),
+        "method": str(row.get("method", "unknown")),
         "prediction": prediction,
         "timestamp": datetime.now().isoformat(),
-        "true_label": true_label,
+        "true_label": str(row.get("true_label", "")).strip().lower(),
         "correct": bool(correct),
     }
 
