@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import io
 import random
 import secrets
@@ -12,9 +13,8 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
-from PIL import Image
-import base64
 import streamlit.components.v1 as components
+from PIL import Image
 
 
 APP_TITLE = "Clinician Fake/Real Classification"
@@ -43,8 +43,10 @@ def init_state():
         "submitted": False,
         "evaluation_type": "frames",
         "uploaded_zip_name": "",
-        "detected_view": "unknown",
+        "detected_view_group": "unknown_group",
+        "detected_view": "unknown_view",
     }
+
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
@@ -63,11 +65,18 @@ def reset_session():
     st.session_state.submitted = False
     st.session_state.evaluation_type = "frames"
     st.session_state.uploaded_zip_name = ""
-    st.session_state.detected_view = "unknown"
+    st.session_state.detected_view_group = "unknown_group"
+    st.session_state.detected_view = "unknown_view"
 
 
-def detect_view_from_name(name: str) -> str:
+def detect_view_info_from_name(name: str) -> tuple[str, str]:
     name = str(name).lower()
+
+    group_patterns = {
+        "apical": ["apical"],
+        "parasternal": ["parasternal"],
+        "subcostal": ["subcostal", "sub_xiphoid", "subxiphoid"],
+    }
 
     view_patterns = {
         "A4C": ["a4c", "4ch", "4_ch", "4-ch"],
@@ -76,13 +85,23 @@ def detect_view_from_name(name: str) -> str:
         "A2C": ["a2c", "2ch", "2_ch", "2-ch"],
         "PSAX": ["psax"],
         "PLAX": ["plax"],
+        "SUBCOSTAL": ["subcostal", "sub_xiphoid", "subxiphoid"],
     }
+
+    detected_group = "unknown_group"
+    detected_view = "unknown_view"
+
+    for group, patterns in group_patterns.items():
+        if any(p in name for p in patterns):
+            detected_group = group
+            break
 
     for view, patterns in view_patterns.items():
         if any(p in name for p in patterns):
-            return view
+            detected_view = view
+            break
 
-    return "unknown"
+    return detected_group, detected_view
 
 
 def extract_zip_to_temp(zip_file) -> Path:
@@ -100,8 +119,10 @@ def extract_zip_to_temp(zip_file) -> Path:
 
 def find_mixed_dir(base_dir: Path) -> Path:
     mixed_dirs = [p for p in base_dir.rglob("mixed") if p.is_dir()]
+
     if not mixed_dirs:
         raise FileNotFoundError("Could not find a 'mixed' folder inside the ZIP.")
+
     return mixed_dirs[0]
 
 
@@ -113,6 +134,7 @@ def load_hidden_gt_from_secrets() -> pd.DataFrame:
     gt_df = pd.read_csv(io.StringIO(gt_tsv), sep="\t")
 
     required_cols = {"mixed_name", "true_label", "original_file"}
+
     if not required_cols.issubset(gt_df.columns):
         raise ValueError(
             f"GT in secrets must contain columns: {sorted(required_cols)}"
@@ -128,48 +150,56 @@ def load_hidden_gt_from_secrets() -> pd.DataFrame:
     else:
         gt_df["method"] = gt_df["method"].astype(str).str.strip()
 
+    if "view_group" not in gt_df.columns:
+        gt_df["view_group"] = ""
+    else:
+        gt_df["view_group"] = gt_df["view_group"].astype(str).str.strip()
+
+    if "view_label" not in gt_df.columns:
+        gt_df["view_label"] = ""
+    else:
+        gt_df["view_label"] = gt_df["view_label"].astype(str).str.strip()
+
+    if "original_patient" not in gt_df.columns:
+        gt_df["original_patient"] = ""
+    else:
+        gt_df["original_patient"] = gt_df["original_patient"].astype(str).str.strip()
+
+    if "source_folder" not in gt_df.columns:
+        gt_df["source_folder"] = ""
+    else:
+        gt_df["source_folder"] = gt_df["source_folder"].astype(str).str.strip()
+
+    if "source_frame" not in gt_df.columns:
+        gt_df["source_frame"] = ""
+    else:
+        gt_df["source_frame"] = gt_df["source_frame"].astype(str).str.strip()
+
+    gt_df["mixed_stem"] = gt_df["mixed_name"].apply(lambda x: Path(str(x)).stem)
+
     return gt_df
 
-
-def find_media_file_by_stem(mixed_dir: Path, mixed_name: str, evaluation_type: str) -> Path:
-    stem = Path(str(mixed_name)).stem
-    allowed_exts = IMAGE_EXTS if evaluation_type == "frames" else VIDEO_EXTS
-
-    matches = [
-        p for p in mixed_dir.iterdir()
-        if p.is_file()
-        and p.stem == stem
-        and p.suffix.lower() in allowed_exts
-    ]
-
-    if len(matches) == 0:
-        raise FileNotFoundError(
-            f"Could not find media for {mixed_name} in {evaluation_type} mode. "
-            f"Expected stem: {stem}"
-        )
-
-    if len(matches) > 1:
-        raise RuntimeError(
-            f"Multiple files found for stem {stem}: {[m.name for m in matches]}"
-        )
-
-    return matches[0]
 
 def load_dataset(
     mixed_dir: Path,
     evaluation_type: str,
     uploaded_zip_name: str = "",
-    ) -> pd.DataFrame:
-
+) -> pd.DataFrame:
     gt_df = load_hidden_gt_from_secrets()
 
-    detected_view = detect_view_from_name(uploaded_zip_name)
-    if detected_view == "unknown":
-        detected_view = detect_view_from_name(str(mixed_dir))
+    detected_group, detected_view = detect_view_info_from_name(uploaded_zip_name)
+
+    if detected_group == "unknown_group" or detected_view == "unknown_view":
+        folder_group, folder_view = detect_view_info_from_name(str(mixed_dir))
+
+        if detected_group == "unknown_group":
+            detected_group = folder_group
+
+        if detected_view == "unknown_view":
+            detected_view = folder_view
 
     allowed_exts = IMAGE_EXTS if evaluation_type == "frames" else VIDEO_EXTS
 
-    # 👉 STEP 1: list actual files in folder
     files = [
         p for p in mixed_dir.iterdir()
         if p.is_file() and p.suffix.lower() in allowed_exts
@@ -178,36 +208,43 @@ def load_dataset(
     if len(files) == 0:
         raise RuntimeError(f"No {evaluation_type} files found in {mixed_dir}")
 
-    # 👉 STEP 2: build dataset from files
     rows = []
-    for p in files:
-        stem = p.stem
 
-        # match GT by stem
-        match = gt_df[gt_df["mixed_name"].str.contains(stem)]
+    for p in sorted(files):
+        stem = p.stem
+        match = gt_df[gt_df["mixed_stem"] == stem]
 
         if len(match) == 0:
             continue
 
         row = match.iloc[0].copy()
+
         row["media_path"] = str(p)
         row["displayed_file"] = p.name
-        row["label"] = detected_view
+
+        if not str(row.get("view_group", "")).strip():
+            row["view_group"] = detected_group
+
+        if not str(row.get("view_label", "")).strip():
+            row["view_label"] = detected_view
+
+        row["label"] = row["view_label"]
 
         rows.append(row)
 
     if len(rows) == 0:
-        raise RuntimeError("No matching GT entries found for files")
+        raise RuntimeError("No matching GT entries found for files.")
 
     df = pd.DataFrame(rows)
 
-    # 👉 STEP 3: shuffle ONLY actual files
     rng = random.Random(int(st.session_state.seed))
     df = df.sample(frac=1, random_state=rng.randint(0, 10**6)).reset_index(drop=True)
 
+    st.session_state.detected_view_group = detected_group
     st.session_state.detected_view = detected_view
 
     return df
+
 
 def responses_to_df() -> pd.DataFrame:
     if not st.session_state.responses:
@@ -217,13 +254,19 @@ def responses_to_df() -> pd.DataFrame:
                 "reader_id",
                 "reader_name",
                 "evaluation_type",
+                "detected_view_group",
                 "detected_view",
                 "sample_idx",
                 "mixed_name",
                 "displayed_file",
                 "original_file",
-                "label",
                 "method",
+                "view_group",
+                "view_label",
+                "label",
+                "original_patient",
+                "source_folder",
+                "source_frame",
                 "prediction",
                 "timestamp",
                 "true_label",
@@ -237,8 +280,14 @@ def responses_to_df() -> pd.DataFrame:
 def save_session_csv() -> Path:
     safe_reader = (st.session_state.reader_id or "reader").replace(" ", "_")
     mode = st.session_state.evaluation_type
+    group = st.session_state.detected_view_group
     view = st.session_state.detected_view
-    out = RESULTS_DIR / f"responses_{mode}_{view}_{safe_reader}_{st.session_state.session_uid}.csv"
+
+    out = RESULTS_DIR / (
+        f"responses_{mode}_{group}_{view}_{safe_reader}_"
+        f"{st.session_state.session_uid}.csv"
+    )
+
     responses_to_df().to_csv(out, index=False)
     return out
 
@@ -249,7 +298,8 @@ def compute_scores(df: pd.DataFrame) -> dict:
             "overall_accuracy": 0.0,
             "total": 0,
             "correct": 0,
-            "by_label": pd.DataFrame(columns=["label", "n", "correct", "accuracy"]),
+            "by_group": pd.DataFrame(columns=["view_group", "n", "correct", "accuracy"]),
+            "by_view": pd.DataFrame(columns=["view_label", "n", "correct", "accuracy"]),
             "by_method": pd.DataFrame(columns=["method", "n", "correct", "accuracy"]),
         }
 
@@ -257,12 +307,19 @@ def compute_scores(df: pd.DataFrame) -> dict:
     correct = int(df["correct"].sum())
     overall_accuracy = correct / total if total else 0.0
 
-    by_label = (
-        df.groupby("label", dropna=False)
-        .agg(n=("label", "size"), correct=("correct", "sum"))
+    by_group = (
+        df.groupby("view_group", dropna=False)
+        .agg(n=("view_group", "size"), correct=("correct", "sum"))
         .reset_index()
     )
-    by_label["accuracy"] = by_label["correct"] / by_label["n"]
+    by_group["accuracy"] = by_group["correct"] / by_group["n"]
+
+    by_view = (
+        df.groupby("view_label", dropna=False)
+        .agg(n=("view_label", "size"), correct=("correct", "sum"))
+        .reset_index()
+    )
+    by_view["accuracy"] = by_view["correct"] / by_view["n"]
 
     by_method = (
         df.groupby("method", dropna=False)
@@ -275,7 +332,8 @@ def compute_scores(df: pd.DataFrame) -> dict:
         "overall_accuracy": overall_accuracy,
         "total": total,
         "correct": correct,
-        "by_label": by_label,
+        "by_group": by_group,
+        "by_view": by_view,
         "by_method": by_method,
     }
 
@@ -293,6 +351,7 @@ def send_email_with_csv(csv_path: Path, scores: dict):
     msg["Subject"] = (
         f"Clinician Study Results - "
         f"{st.session_state.evaluation_type} - "
+        f"{st.session_state.detected_view_group} - "
         f"{st.session_state.detected_view} - "
         f"{st.session_state.reader_id} - "
         f"{st.session_state.session_uid}"
@@ -300,6 +359,7 @@ def send_email_with_csv(csv_path: Path, scores: dict):
 
     body = (
         f"Evaluation type: {st.session_state.evaluation_type}\n"
+        f"Detected view group: {st.session_state.detected_view_group}\n"
         f"Detected view: {st.session_state.detected_view}\n"
         f"Reader ID: {st.session_state.reader_id}\n"
         f"Reader name: {st.session_state.reader_name}\n"
@@ -308,18 +368,29 @@ def send_email_with_csv(csv_path: Path, scores: dict):
         f"Correct: {scores['correct']}\n"
         f"Accuracy: {scores['overall_accuracy']:.4f}\n"
         f"Notes: {st.session_state.notes}\n\n"
-        f"Accuracy by view/label:\n"
+        f"Accuracy by group:\n"
     )
 
-    if not scores["by_label"].empty:
-        for _, row in scores["by_label"].iterrows():
+    if not scores["by_group"].empty:
+        for _, row in scores["by_group"].iterrows():
             body += (
-                f"- {row['label']}: "
+                f"- {row['view_group']}: "
+                f"{int(row['correct'])}/{int(row['n'])} "
+                f"({row['accuracy']:.4f})\n"
+            )
+
+    body += "\nAccuracy by view:\n"
+
+    if not scores["by_view"].empty:
+        for _, row in scores["by_view"].iterrows():
+            body += (
+                f"- {row['view_label']}: "
                 f"{int(row['correct'])}/{int(row['n'])} "
                 f"({row['accuracy']:.4f})\n"
             )
 
     body += "\nAccuracy by method:\n"
+
     if not scores["by_method"].empty:
         for _, row in scores["by_method"].iterrows():
             body += (
@@ -359,7 +430,7 @@ def record_answer(prediction: str):
     idx = st.session_state.current_idx
     row = df.iloc[idx]
 
-    true_label = str(row["true_label"]).strip().lower()
+    true_label = str(row.get("true_label", "")).strip().lower()
     correct = prediction == true_label
 
     response = {
@@ -367,16 +438,22 @@ def record_answer(prediction: str):
         "reader_id": st.session_state.reader_id,
         "reader_name": st.session_state.reader_name,
         "evaluation_type": st.session_state.evaluation_type,
+        "detected_view_group": st.session_state.detected_view_group,
         "detected_view": st.session_state.detected_view,
         "sample_idx": idx,
         "mixed_name": str(row.get("mixed_name", "")),
         "displayed_file": str(row.get("displayed_file", "")),
         "original_file": str(row.get("original_file", "")),
-        "label": str(row.get("label", st.session_state.detected_view)),
         "method": str(row.get("method", "unknown")),
+        "view_group": str(row.get("view_group", st.session_state.detected_view_group)),
+        "view_label": str(row.get("view_label", st.session_state.detected_view)),
+        "label": str(row.get("label", row.get("view_label", st.session_state.detected_view))),
+        "original_patient": str(row.get("original_patient", "")),
+        "source_folder": str(row.get("source_folder", "")),
+        "source_frame": str(row.get("source_frame", "")),
         "prediction": prediction,
         "timestamp": datetime.now().isoformat(),
-        "true_label": str(row.get("true_label", "")).strip().lower(),
+        "true_label": true_label,
         "correct": bool(correct),
     }
 
@@ -385,11 +462,11 @@ def record_answer(prediction: str):
 
 
 def show_media(media_path: Path):
-    DISPLAY_WIDTH = 200
+    display_width = 200
 
     if st.session_state.evaluation_type == "frames":
         image = Image.open(media_path)
-        st.image(image, width=DISPLAY_WIDTH)
+        st.image(image, width=display_width)
 
     else:
         with open(media_path, "rb") as f:
@@ -399,18 +476,16 @@ def show_media(media_path: Path):
 
         components.html(
             f"""
-            <video width="{DISPLAY_WIDTH}" controls muted style="width:{DISPLAY_WIDTH}px; height:auto;">
+            <video width="{display_width}" controls muted style="width:{display_width}px; height:auto;">
                 <source src="data:video/mp4;base64,{video_base64}" type="video/mp4">
             </video>
             """,
-            width=DISPLAY_WIDTH,
-            height=DISPLAY_WIDTH + 40,
+            width=display_width,
+            height=display_width + 40,
             scrolling=False,
         )
 
-# ============================================================
-# UI
-# ============================================================
+
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 init_state()
 
@@ -433,6 +508,7 @@ with st.sidebar:
     )
 
     st.caption(f"Automatic session seed: {st.session_state.seed}")
+    st.caption(f"Detected group: {st.session_state.detected_view_group}")
     st.caption(f"Detected view: {st.session_state.detected_view}")
     st.caption(f"Results destination: {RESULTS_EMAIL}")
 
@@ -484,7 +560,8 @@ if not st.session_state.setup_done:
 
             st.success(
                 f"Loaded {len(dataset)} samples. "
-                f"Detected view: {st.session_state.detected_view}"
+                f"Detected group: {st.session_state.detected_view_group}. "
+                f"Detected view: {st.session_state.detected_view}."
             )
             st.rerun()
 
@@ -533,7 +610,7 @@ if idx < n_total:
     with left:
         st.subheader(f"Sample {idx + 1} / {n_total}")
         show_media(media_path)
-    
+
     with right:
         st.subheader("Classification")
         st.write(f"Reader ID: **{st.session_state.reader_id}**")
