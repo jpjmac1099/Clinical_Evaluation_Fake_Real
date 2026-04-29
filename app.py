@@ -70,39 +70,31 @@ def reset_session():
 
 
 def detect_view_info_from_name(name: str) -> tuple[str, str]:
-    name = str(name).lower()
-
-    group_patterns = {
-        "apical": ["apical"],
-        "parasternal": ["parasternal"],
-        "subcostal": ["subcostal", "sub_xiphoid", "subxiphoid"],
-    }
+    path_str = str(name).lower()
 
     view_patterns = {
         "A4C": ["a4c", "4ch", "4_ch", "4-ch"],
-        "A3C": ["a3c", "3ch", "3_ch", "3-ch"],
         "A5C": ["a5c", "5ch", "5_ch", "5-ch"],
+        "A3C": ["a3c", "3ch", "3_ch", "3-ch"],
         "A2C": ["a2c", "2ch", "2_ch", "2-ch"],
         "PSAX": ["psax"],
         "PLAX": ["plax"],
-        "SUBCOSTAL": ["subcostal", "sub_xiphoid", "subxiphoid"],
     }
 
-    detected_group = "unknown_group"
-    detected_view = "unknown_view"
-
-    for group, patterns in group_patterns.items():
-        if any(p in name for p in patterns):
-            detected_group = group
-            break
-
+    view_label = "unknown_view"
     for view, patterns in view_patterns.items():
-        if any(p in name for p in patterns):
-            detected_view = view
+        if any(p in path_str for p in patterns):
+            view_label = view
             break
 
-    return detected_group, detected_view
+    if view_label in ["A4C", "A5C", "A3C", "A2C"]:
+        view_group = "apical"
+    elif view_label in ["PSAX", "PLAX"]:
+        view_group = "parasternal"
+    else:
+        view_group = "unknown_group"
 
+    return view_group, view_label
 
 def extract_zip_to_temp(zip_file) -> Path:
     temp_dir = Path(tempfile.mkdtemp(prefix="study_upload_"))
