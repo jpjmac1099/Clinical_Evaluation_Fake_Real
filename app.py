@@ -609,14 +609,9 @@ if not st.session_state.started:
 
     st.stop()
 
-
 idx = st.session_state.current_idx
 
 if idx < n_total:
-    row = df.iloc[idx]
-    media_path = Path(row["media_path"])
-
-    if idx < n_total:
     row = df.iloc[idx]
     media_path = Path(row["media_path"])
 
@@ -659,46 +654,6 @@ if idx < n_total:
                 st.error(f"Could not send email: {e}")
 
     st.stop()
-
-    with left:
-        st.subheader(f"Sample {idx + 1} / {n_total}")
-        show_media(media_path)
-
-    with right:
-        st.subheader("Classification")
-        st.write(f"Reader ID: **{st.session_state.reader_id}**")
-
-        if st.session_state.reader_name.strip():
-            st.write(f"Reader name: **{st.session_state.reader_name}**")
-
-        col_real, col_fake = st.columns(2)
-
-        with col_real:
-            if st.button("Real", use_container_width=True, type="primary"):
-                record_answer("real")
-                st.rerun()
-
-        with col_fake:
-            if st.button("Fake", use_container_width=True):
-                record_answer("fake")
-                st.rerun()
-
-        st.markdown("---")
-
-        if st.button(
-            "Submit now",
-            use_container_width=True,
-            disabled=answered == 0 or st.session_state.submitted,
-        ):
-            try:
-                submit_results()
-                st.success(f"Results sent to {RESULTS_EMAIL}")
-            except Exception as e:
-                st.error(f"Could not send email: {e}")
-
-    st.stop()
-
-
 st.success("Session complete.")
 
 st.session_state.notes = st.text_area(
