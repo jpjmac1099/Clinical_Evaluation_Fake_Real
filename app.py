@@ -462,7 +462,9 @@ def record_answer(prediction: str):
 
 
 def show_media(media_path: Path):
-    display_width = 200
+    display_width = 220
+    iframe_width = display_width + 30
+    iframe_height = display_width + 60
 
     if st.session_state.evaluation_type == "frames":
         image = Image.open(media_path)
@@ -476,12 +478,21 @@ def show_media(media_path: Path):
 
         components.html(
             f"""
-            <video width="{display_width}" controls muted style="width:{display_width}px; height:auto;">
-                <source src="data:video/mp4;base64,{video_base64}" type="video/mp4">
-            </video>
+            <html>
+            <body style="margin:0; padding:0; overflow:hidden;">
+                <video
+                    width="{display_width}"
+                    controls
+                    muted
+                    style="width:{display_width}px; height:auto; display:block;"
+                >
+                    <source src="data:video/mp4;base64,{video_base64}" type="video/mp4">
+                </video>
+            </body>
+            </html>
             """,
-            width=display_width,
-            height=display_width + 40,
+            width=iframe_width,
+            height=iframe_height,
             scrolling=False,
         )
 
@@ -605,7 +616,49 @@ if idx < n_total:
     row = df.iloc[idx]
     media_path = Path(row["media_path"])
 
-    left, right = st.columns([0.35, 1.65])
+    if idx < n_total:
+    row = df.iloc[idx]
+    media_path = Path(row["media_path"])
+
+    left, spacer, right = st.columns([0.7, 0.1, 1.2])
+
+    with left:
+        st.subheader(f"Sample {idx + 1} / {n_total}")
+        show_media(media_path)
+
+    with right:
+        st.subheader("Classification")
+        st.write(f"Reader ID: **{st.session_state.reader_id}**")
+
+        if st.session_state.reader_name.strip():
+            st.write(f"Reader name: **{st.session_state.reader_name}**")
+
+        col_real, col_fake = st.columns(2)
+
+        with col_real:
+            if st.button("Real", use_container_width=True, type="primary"):
+                record_answer("real")
+                st.rerun()
+
+        with col_fake:
+            if st.button("Fake", use_container_width=True):
+                record_answer("fake")
+                st.rerun()
+
+        st.markdown("---")
+
+        if st.button(
+            "Submit now",
+            use_container_width=True,
+            disabled=answered == 0 or st.session_state.submitted,
+        ):
+            try:
+                submit_results()
+                st.success(f"Results sent to {RESULTS_EMAIL}")
+            except Exception as e:
+                st.error(f"Could not send email: {e}")
+
+    st.stop()
 
     with left:
         st.subheader(f"Sample {idx + 1} / {n_total}")
