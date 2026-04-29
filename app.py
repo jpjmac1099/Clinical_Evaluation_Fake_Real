@@ -214,8 +214,17 @@ def load_dataset(
         row["media_path"] = str(p)
         row["displayed_file"] = p.name
 
-        if not str(row.get("view_group", "")).strip():
-            row["view_group"] = detected_group
+        if (not str(row.get("view_group", "")).strip()or str(row.get("view_group", "")).strip() == "unknown_group"):
+            view_label_for_group = str(row.get("view_label", "")).strip()
+        
+            if view_label_for_group in ["A4C", "A5C", "A3C", "A2C"]:
+                row["view_group"] = "apical"
+            elif view_label_for_group in ["PSAX", "PLAX"]:
+                row["view_group"] = "parasternal"
+            elif view_label_for_group == "SUBCOSTAL":
+                row["view_group"] = "subcostal"
+            else:
+                row["view_group"] = detected_group
 
         if not str(row.get("view_label", "")).strip():
             row["view_label"] = detected_view
@@ -232,7 +241,7 @@ def load_dataset(
     rng = random.Random(int(st.session_state.seed))
     df = df.sample(frac=1, random_state=rng.randint(0, 10**6)).reset_index(drop=True)
 
-    st.session_state.detected_view_group = detected_group
+    st.session_state.detected_view_group = (df["view_group"].iloc[0] if len(df) > 0 else detected_group)
     st.session_state.detected_view = detected_view
 
     return df
