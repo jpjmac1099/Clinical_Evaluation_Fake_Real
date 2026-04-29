@@ -443,7 +443,8 @@ def record_answer(prediction: str):
         "sample_idx": idx,
         "mixed_name": str(row.get("mixed_name", "")),
         "displayed_file": str(row.get("displayed_file", "")),
-        "original_file": str(row.get("original_file", "")),
+        "original_file": str(row.get("original_file", "")),      # dataset filename
+        "original_patient": str(row.get("original_patient", "")), # real case ID
         "method": str(row.get("method", "unknown")),
         "view_group": str(row.get("view_group", st.session_state.detected_view_group)),
         "view_label": str(row.get("view_label", st.session_state.detected_view)),
