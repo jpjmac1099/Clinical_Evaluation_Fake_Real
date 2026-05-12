@@ -18,7 +18,7 @@ APP_TITLE = "Clinician Fake/Real Classification"
 RESULTS_EMAIL = "jpav.freitas@gmail.com"
 
 APP_DIR = Path(__file__).parent
-LOCAL_MIXED_DIR = APP_DIR / "mixed"
+LOCAL_MIXED_DIR = APP_DIR / "mixed.zip"
 
 RESULTS_DIR = APP_DIR / "results"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
