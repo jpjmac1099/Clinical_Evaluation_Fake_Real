@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 import base64
-import io
 import random
 import secrets
 import smtplib
-import tempfile
-import zipfile
 from datetime import datetime
 from email.message import EmailMessage
 from pathlib import Path
@@ -20,7 +17,10 @@ from PIL import Image
 APP_TITLE = "Clinician Fake/Real Classification"
 RESULTS_EMAIL = "jpav.freitas@gmail.com"
 
-RESULTS_DIR = Path("results")
+APP_DIR = Path(__file__).parent
+LOCAL_MIXED_DIR = APP_DIR / "mixed"
+
+RESULTS_DIR = APP_DIR / "results"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
@@ -42,7 +42,6 @@ def init_state():
         "setup_done": False,
         "submitted": False,
         "evaluation_type": "frames",
-        "uploaded_zip_name": "",
         "detected_view_group": "unknown_group",
         "detected_view": "unknown_view",
         "final_scores": None,
@@ -65,7 +64,6 @@ def reset_session():
     st.session_state.setup_done = False
     st.session_state.submitted = False
     st.session_state.evaluation_type = "frames"
-    st.session_state.uploaded_zip_name = ""
     st.session_state.detected_view_group = "unknown_group"
     st.session_state.detected_view = "unknown_view"
     st.session_state.final_scores = None
@@ -84,6 +82,7 @@ def detect_view_info_from_name(name: str) -> tuple[str, str]:
     }
 
     view_label = "unknown_view"
+
     for view, patterns in view_patterns.items():
         if any(p in path_str for p in patterns):
             view_label = view
@@ -104,34 +103,14 @@ def group_from_view(view_label: str) -> str:
 
     if view_label in ["A4C", "A5C", "A3C", "A2C"]:
         return "apical"
+
     if view_label in ["PSAX", "PLAX"]:
         return "parasternal"
+
     if view_label == "SUBCOSTAL":
         return "subcostal"
 
     return "unknown_group"
-
-
-def extract_zip_to_temp(zip_file) -> Path:
-    temp_dir = Path(tempfile.mkdtemp(prefix="study_upload_"))
-    zip_path = temp_dir / "study_package.zip"
-
-    with open(zip_path, "wb") as f:
-        f.write(zip_file.getbuffer())
-
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        zf.extractall(temp_dir)
-
-    return temp_dir
-
-
-def find_mixed_dir(base_dir: Path) -> Path:
-    mixed_dirs = [p for p in base_dir.rglob("mixed") if p.is_dir()]
-
-    if not mixed_dirs:
-        raise FileNotFoundError("Could not find a 'mixed' folder inside the ZIP.")
-
-    return mixed_dirs[0]
 
 
 def load_hidden_gt_from_secrets() -> pd.DataFrame:
@@ -139,12 +118,6 @@ def load_hidden_gt_from_secrets() -> pd.DataFrame:
         raise RuntimeError("Missing [gt].tsv in Streamlit secrets.")
 
     gt_text = str(st.secrets["gt"]["tsv"]).strip()
-    required_cols = {"mixed_name", "true_label", "original_file"}
-
-    tokens = gt_text.split()
-
-    if len(tokens) < 10:
-        raise ValueError("GT secret is too short or empty.")
 
     expected_header = [
         "mixed_name",
@@ -158,8 +131,15 @@ def load_hidden_gt_from_secrets() -> pd.DataFrame:
         "source_frame",
     ]
 
-    # Find the header position
+    required_cols = {"mixed_name", "true_label", "original_file"}
+
+    tokens = gt_text.split()
+
+    if len(tokens) < len(expected_header) + 9:
+        raise ValueError("GT secret is too short or empty.")
+
     header_start = None
+
     for i in range(len(tokens) - len(expected_header) + 1):
         if tokens[i : i + len(expected_header)] == expected_header:
             header_start = i
@@ -171,35 +151,26 @@ def load_hidden_gt_from_secrets() -> pd.DataFrame:
             + " ".join(expected_header)
         )
 
-    data_tokens = tokens[header_start + len(expected_header) :]
+    data_tokens = tokens[header_start + len(expected_header):]
+
+    valid_exts = IMAGE_EXTS | VIDEO_EXTS
 
     rows = []
     i = 0
 
     while i < len(data_tokens):
         mixed_name = data_tokens[i]
+        suffix = Path(mixed_name).suffix.lower()
 
-        # Every valid row must start with sample_XXXX.png or sample_XXXX.mp4
-        if not (
+        is_sample_start = (
             mixed_name.startswith("sample_")
-            and (
-                mixed_name.lower().endswith(".png")
-                or mixed_name.lower().endswith(".jpg")
-                or mixed_name.lower().endswith(".jpeg")
-                or mixed_name.lower().endswith(".bmp")
-                or mixed_name.lower().endswith(".tif")
-                or mixed_name.lower().endswith(".tiff")
-                or mixed_name.lower().endswith(".mp4")
-                or mixed_name.lower().endswith(".mov")
-                or mixed_name.lower().endswith(".avi")
-                or mixed_name.lower().endswith(".mkv")
-                or mixed_name.lower().endswith(".webm")
-            )
-        ):
+            and suffix in valid_exts
+        )
+
+        if not is_sample_start:
             i += 1
             continue
 
-        # Need 9 fields per row
         if i + 8 >= len(data_tokens):
             break
 
@@ -221,7 +192,7 @@ def load_hidden_gt_from_secrets() -> pd.DataFrame:
     if not rows:
         raise ValueError(
             "GT header was found, but no sample rows were parsed. "
-            "Rows must start with sample_XXXX.png or sample_XXXX.mp4."
+            "Each row must start with sample_XXXX.png or sample_XXXX.mp4."
         )
 
     gt_df = pd.DataFrame(rows)
@@ -241,7 +212,6 @@ def load_hidden_gt_from_secrets() -> pd.DataFrame:
 
     gt_df["true_label"] = gt_df["true_label"].str.lower()
 
-    # Match using full mixed filename
     gt_df["mixed_name_norm"] = (
         gt_df["mixed_name"]
         .astype(str)
@@ -271,22 +241,15 @@ def load_hidden_gt_from_secrets() -> pd.DataFrame:
 def load_dataset(
     mixed_dir: Path,
     evaluation_type: str,
-    uploaded_zip_name: str = "",
 ) -> pd.DataFrame:
     gt_df = load_hidden_gt_from_secrets()
 
-    detected_group, detected_view = detect_view_info_from_name(uploaded_zip_name)
-
-    if detected_group == "unknown_group" or detected_view == "unknown_view":
-        folder_group, folder_view = detect_view_info_from_name(str(mixed_dir))
-
-        if detected_group == "unknown_group":
-            detected_group = folder_group
-
-        if detected_view == "unknown_view":
-            detected_view = folder_view
+    detected_group, detected_view = detect_view_info_from_name(str(mixed_dir))
 
     allowed_exts = IMAGE_EXTS if evaluation_type == "frames" else VIDEO_EXTS
+
+    if not mixed_dir.exists() or not mixed_dir.is_dir():
+        raise FileNotFoundError(f"Could not find local mixed folder: {mixed_dir}")
 
     files = [
         p for p in mixed_dir.iterdir()
@@ -294,15 +257,20 @@ def load_dataset(
     ]
 
     if len(files) == 0:
-        raise RuntimeError(f"No {evaluation_type} files found in {mixed_dir}")
+        raise RuntimeError(
+            f"No {evaluation_type} files found in {mixed_dir}. "
+            f"Expected extensions: {sorted(allowed_exts)}"
+        )
 
     rows = []
+    unmatched_files = []
 
     for p in sorted(files):
         mixed_name = p.name.strip().lower()
         match = gt_df[gt_df["mixed_name_norm"] == mixed_name]
 
         if len(match) == 0:
+            unmatched_files.append(p.name)
             continue
 
         row = match.iloc[0].copy()
@@ -315,6 +283,7 @@ def load_dataset(
 
         if not str(row.get("view_group", "")).strip() or row["view_group"] == "unknown_group":
             row["view_group"] = group_from_view(row["view_label"])
+
             if row["view_group"] == "unknown_group":
                 row["view_group"] = detected_group
 
@@ -323,26 +292,32 @@ def load_dataset(
         rows.append(row)
 
     if len(rows) == 0:
-        raise RuntimeError("No matching GT entries found for files.")
+        mixed_files = [p.name for p in sorted(files)]
+        gt_names = gt_df["mixed_name_norm"].astype(str).tolist()
+
+        raise RuntimeError(
+            "No matching GT entries found for files.\n\n"
+            f"First files in mixed/: {mixed_files[:20]}\n\n"
+            f"First GT mixed_name values: {gt_names[:20]}\n\n"
+            f"Number of files in mixed/: {len(mixed_files)}\n"
+            f"Number of rows in GT: {len(gt_df)}"
+        )
 
     df = pd.DataFrame(rows)
 
     rng = random.Random(int(st.session_state.seed))
     df = df.sample(frac=1, random_state=rng.randint(0, 10**6)).reset_index(drop=True)
 
-    if len(df) > 0:
-        unique_groups = sorted(df["view_group"].dropna().unique())
-        unique_views = sorted(df["view_label"].dropna().unique())
+    unique_groups = sorted(df["view_group"].dropna().unique())
+    unique_views = sorted(df["view_label"].dropna().unique())
 
-        st.session_state.detected_view_group = (
-            unique_groups[0] if len(unique_groups) == 1 else "mixed"
-        )
-        st.session_state.detected_view = (
-            unique_views[0] if len(unique_views) == 1 else "mixed"
-        )
-    else:
-        st.session_state.detected_view_group = detected_group
-        st.session_state.detected_view = detected_view
+    st.session_state.detected_view_group = (
+        unique_groups[0] if len(unique_groups) == 1 else "mixed"
+    )
+
+    st.session_state.detected_view = (
+        unique_views[0] if len(unique_views) == 1 else "mixed"
+    )
 
     return df
 
@@ -495,6 +470,7 @@ def send_email_with_csv(csv_path: Path, scores: dict):
             )
 
     body += "\nAccuracy by view:\n"
+
     if not scores["by_view"].empty:
         for _, row in scores["by_view"].iterrows():
             body += (
@@ -504,6 +480,7 @@ def send_email_with_csv(csv_path: Path, scores: dict):
             )
 
     body += "\nAccuracy by method:\n"
+
     if not scores["by_method"].empty:
         for _, row in scores["by_method"].iterrows():
             body += (
@@ -513,6 +490,7 @@ def send_email_with_csv(csv_path: Path, scores: dict):
             )
 
     body += "\nAccuracy by view and method:\n"
+
     if not scores["by_view_method"].empty:
         for _, row in scores["by_view_method"].iterrows():
             body += (
@@ -635,13 +613,17 @@ def show_score_summary(scores: dict):
     c2.metric("Correct", correct)
     c3.metric("Wrong", wrong)
 
-    st.write(f"You got **{correct} correct** and **{wrong} wrong** out of **{total}** samples.")
+    st.write(
+        f"You got **{correct} correct** and **{wrong} wrong** "
+        f"out of **{total}** samples."
+    )
+
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 init_state()
 
 st.title(APP_TITLE)
-st.caption("Upload one ZIP containing only the mixed/ folder.")
+st.caption("Using the local mixed/ folder included in the app repository.")
 
 with st.sidebar:
     st.header("Reader")
@@ -680,48 +662,36 @@ st.session_state.evaluation_type = st.radio(
     disabled=st.session_state.setup_done,
 )
 
-st.subheader("1. Upload study package")
 
-uploaded_zip = st.file_uploader(
-    "Upload one ZIP with the mixed/ folder only",
-    type=["zip"],
-)
+st.subheader("1. Load local mixed folder")
+
+st.info(f"Using local folder: `{LOCAL_MIXED_DIR}`")
 
 if not st.session_state.setup_done:
-    if st.button("Load uploaded ZIP", type="primary"):
-        if not uploaded_zip:
-            st.error("Please upload the ZIP file.")
-            st.stop()
-
+    if st.button("Load mixed folder", type="primary"):
         try:
-            st.session_state.uploaded_zip_name = uploaded_zip.name
-
-            temp_dir = extract_zip_to_temp(uploaded_zip)
-            mixed_dir = find_mixed_dir(temp_dir)
-
             dataset = load_dataset(
-                mixed_dir=mixed_dir,
+                mixed_dir=LOCAL_MIXED_DIR,
                 evaluation_type=st.session_state.evaluation_type,
-                uploaded_zip_name=uploaded_zip.name,
             )
 
-            st.session_state.working_dir = str(temp_dir)
+            st.session_state.working_dir = str(LOCAL_MIXED_DIR)
             st.session_state.dataset = dataset
             st.session_state.setup_done = True
 
             st.success(
-                f"Loaded {len(dataset)} samples. "
+                f"Loaded {len(dataset)} samples from local mixed folder. "
                 f"Detected group: {st.session_state.detected_view_group}. "
                 f"Detected view: {st.session_state.detected_view}."
             )
             st.rerun()
 
         except Exception as e:
-            st.error(f"Failed to load uploaded ZIP: {e}")
+            st.error(f"Failed to load local mixed folder: {e}")
             st.stop()
 
 if not st.session_state.setup_done:
-    st.info("Choose the evaluation type, upload the ZIP, then click 'Load uploaded ZIP'.")
+    st.info("Choose the evaluation type, then click 'Load mixed folder'.")
     st.stop()
 
 
