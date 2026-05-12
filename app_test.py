@@ -139,42 +139,89 @@ def load_hidden_gt_from_secrets() -> pd.DataFrame:
         raise RuntimeError("Missing [gt].tsv in Streamlit secrets.")
 
     gt_text = str(st.secrets["gt"]["tsv"]).strip()
-
     required_cols = {"mixed_name", "true_label", "original_file"}
 
-    # Remove empty lines
-    lines = [line.strip() for line in gt_text.splitlines() if line.strip()]
+    tokens = gt_text.split()
 
-    if len(lines) < 2:
-        raise ValueError("GT must contain a header line and at least one data row.")
+    if len(tokens) < 10:
+        raise ValueError("GT secret is too short or empty.")
 
-    # Split header by any whitespace: tabs, one space, many spaces
-    header = lines[0].split()
+    expected_header = [
+        "mixed_name",
+        "true_label",
+        "original_file",
+        "method",
+        "view_group",
+        "view_label",
+        "original_patient",
+        "source_folder",
+        "source_frame",
+    ]
+
+    # Find the header position
+    header_start = None
+    for i in range(len(tokens) - len(expected_header) + 1):
+        if tokens[i : i + len(expected_header)] == expected_header:
+            header_start = i
+            break
+
+    if header_start is None:
+        raise ValueError(
+            "Could not find GT header. Expected header:\n"
+            + " ".join(expected_header)
+        )
+
+    data_tokens = tokens[header_start + len(expected_header) :]
 
     rows = []
-    bad_lines = []
+    i = 0
 
-    for line_number, line in enumerate(lines[1:], start=2):
-        parts = line.split()
+    while i < len(data_tokens):
+        mixed_name = data_tokens[i]
 
-        if len(parts) < len(header):
-            bad_lines.append((line_number, line))
+        # Every valid row must start with sample_XXXX.png or sample_XXXX.mp4
+        if not (
+            mixed_name.startswith("sample_")
+            and (
+                mixed_name.lower().endswith(".png")
+                or mixed_name.lower().endswith(".jpg")
+                or mixed_name.lower().endswith(".jpeg")
+                or mixed_name.lower().endswith(".bmp")
+                or mixed_name.lower().endswith(".tif")
+                or mixed_name.lower().endswith(".tiff")
+                or mixed_name.lower().endswith(".mp4")
+                or mixed_name.lower().endswith(".mov")
+                or mixed_name.lower().endswith(".avi")
+                or mixed_name.lower().endswith(".mkv")
+                or mixed_name.lower().endswith(".webm")
+            )
+        ):
+            i += 1
             continue
 
-        # If there are extra fields, merge them into the last column.
-        # This protects you if source_frame or another final column accidentally has spaces.
-        if len(parts) > len(header):
-            fixed_parts = parts[: len(header) - 1]
-            fixed_parts.append(" ".join(parts[len(header) - 1 :]))
-            parts = fixed_parts
+        # Need 9 fields per row
+        if i + 8 >= len(data_tokens):
+            break
 
-        rows.append(dict(zip(header, parts)))
+        row = {
+            "mixed_name": data_tokens[i],
+            "true_label": data_tokens[i + 1],
+            "original_file": data_tokens[i + 2],
+            "method": data_tokens[i + 3],
+            "view_group": data_tokens[i + 4],
+            "view_label": data_tokens[i + 5],
+            "original_patient": data_tokens[i + 6],
+            "source_folder": data_tokens[i + 7],
+            "source_frame": data_tokens[i + 8],
+        }
+
+        rows.append(row)
+        i += 9
 
     if not rows:
         raise ValueError(
-            "GT was detected, but no valid data rows could be parsed. "
-            f"Header detected: {header}. "
-            f"First bad lines: {bad_lines[:3]}"
+            "GT header was found, but no sample rows were parsed. "
+            "Rows must start with sample_XXXX.png or sample_XXXX.mp4."
         )
 
     gt_df = pd.DataFrame(rows)
@@ -187,24 +234,14 @@ def load_hidden_gt_from_secrets() -> pd.DataFrame:
 
     gt_df = gt_df.copy()
 
-    for col in [
-        "mixed_name",
-        "true_label",
-        "original_file",
-        "method",
-        "view_group",
-        "view_label",
-        "original_patient",
-        "source_folder",
-        "source_frame",
-    ]:
+    for col in expected_header:
         if col not in gt_df.columns:
             gt_df[col] = ""
         gt_df[col] = gt_df[col].astype(str).str.strip()
 
     gt_df["true_label"] = gt_df["true_label"].str.lower()
 
-    # Match using full mixed filename, not stem
+    # Match using full mixed filename
     gt_df["mixed_name_norm"] = (
         gt_df["mixed_name"]
         .astype(str)
