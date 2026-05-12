@@ -4,6 +4,8 @@ import base64
 import random
 import secrets
 import smtplib
+import tempfile
+import zipfile
 from datetime import datetime
 from email.message import EmailMessage
 from pathlib import Path
@@ -18,7 +20,7 @@ APP_TITLE = "Clinician Fake/Real Classification"
 RESULTS_EMAIL = "jpav.freitas@gmail.com"
 
 APP_DIR = Path(__file__).parent
-LOCAL_MIXED_DIR = APP_DIR / "mixed.zip"
+LOCAL_MIXED_ZIP = APP_DIR / "mixed.zip"
 
 RESULTS_DIR = APP_DIR / "results"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -111,6 +113,30 @@ def group_from_view(view_label: str) -> str:
         return "subcostal"
 
     return "unknown_group"
+
+
+def extract_local_zip_to_temp(zip_path: Path) -> Path:
+    if not zip_path.exists():
+        raise FileNotFoundError(f"Could not find local ZIP file: {zip_path}")
+
+    if not zip_path.is_file():
+        raise FileNotFoundError(f"Expected a ZIP file, but got: {zip_path}")
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="study_local_zip_"))
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(temp_dir)
+
+    return temp_dir
+
+
+def find_mixed_dir(base_dir: Path) -> Path:
+    mixed_dirs = [p for p in base_dir.rglob("mixed") if p.is_dir()]
+
+    if not mixed_dirs:
+        raise FileNotFoundError("Could not find a 'mixed' folder inside mixed.zip.")
+
+    return mixed_dirs[0]
 
 
 def load_hidden_gt_from_secrets() -> pd.DataFrame:
@@ -249,7 +275,7 @@ def load_dataset(
     allowed_exts = IMAGE_EXTS if evaluation_type == "frames" else VIDEO_EXTS
 
     if not mixed_dir.exists() or not mixed_dir.is_dir():
-        raise FileNotFoundError(f"Could not find local mixed folder: {mixed_dir}")
+        raise FileNotFoundError(f"Could not find extracted mixed folder: {mixed_dir}")
 
     files = [
         p for p in mixed_dir.iterdir()
@@ -263,14 +289,12 @@ def load_dataset(
         )
 
     rows = []
-    unmatched_files = []
 
     for p in sorted(files):
         mixed_name = p.name.strip().lower()
         match = gt_df[gt_df["mixed_name_norm"] == mixed_name]
 
         if len(match) == 0:
-            unmatched_files.append(p.name)
             continue
 
         row = match.iloc[0].copy()
@@ -297,9 +321,9 @@ def load_dataset(
 
         raise RuntimeError(
             "No matching GT entries found for files.\n\n"
-            f"First files in mixed/: {mixed_files[:20]}\n\n"
+            f"First files in extracted mixed/: {mixed_files[:20]}\n\n"
             f"First GT mixed_name values: {gt_names[:20]}\n\n"
-            f"Number of files in mixed/: {len(mixed_files)}\n"
+            f"Number of files in extracted mixed/: {len(mixed_files)}\n"
             f"Number of rows in GT: {len(gt_df)}"
         )
 
@@ -623,7 +647,7 @@ st.set_page_config(page_title=APP_TITLE, layout="wide")
 init_state()
 
 st.title(APP_TITLE)
-st.caption("Using the local mixed/ folder included in the app repository.")
+st.caption("Using mixed.zip included in the app repository.")
 
 with st.sidebar:
     st.header("Reader")
@@ -663,35 +687,38 @@ st.session_state.evaluation_type = st.radio(
 )
 
 
-st.subheader("1. Load local mixed folder")
+st.subheader("1. Load local mixed ZIP")
 
-st.info(f"Using local folder: `{LOCAL_MIXED_DIR}`")
+st.info(f"Using local ZIP: `{LOCAL_MIXED_ZIP}`")
 
 if not st.session_state.setup_done:
-    if st.button("Load mixed folder", type="primary"):
+    if st.button("Load mixed ZIP", type="primary"):
         try:
+            temp_dir = extract_local_zip_to_temp(LOCAL_MIXED_ZIP)
+            mixed_dir = find_mixed_dir(temp_dir)
+
             dataset = load_dataset(
-                mixed_dir=LOCAL_MIXED_DIR,
+                mixed_dir=mixed_dir,
                 evaluation_type=st.session_state.evaluation_type,
             )
 
-            st.session_state.working_dir = str(LOCAL_MIXED_DIR)
+            st.session_state.working_dir = str(temp_dir)
             st.session_state.dataset = dataset
             st.session_state.setup_done = True
 
             st.success(
-                f"Loaded {len(dataset)} samples from local mixed folder. "
+                f"Loaded {len(dataset)} samples from mixed.zip. "
                 f"Detected group: {st.session_state.detected_view_group}. "
                 f"Detected view: {st.session_state.detected_view}."
             )
             st.rerun()
 
         except Exception as e:
-            st.error(f"Failed to load local mixed folder: {e}")
+            st.error(f"Failed to load local mixed ZIP: {e}")
             st.stop()
 
 if not st.session_state.setup_done:
-    st.info("Choose the evaluation type, then click 'Load mixed folder'.")
+    st.info("Choose the evaluation type, then click 'Load mixed ZIP'.")
     st.stop()
 
 
