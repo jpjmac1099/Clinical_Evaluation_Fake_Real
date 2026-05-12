@@ -139,18 +139,45 @@ def load_hidden_gt_from_secrets() -> pd.DataFrame:
         raise RuntimeError("Missing [gt].tsv in Streamlit secrets.")
 
     gt_text = str(st.secrets["gt"]["tsv"]).strip()
+
     required_cols = {"mixed_name", "true_label", "original_file"}
 
-    # Try real TSV first
-    gt_df = pd.read_csv(io.StringIO(gt_text), sep="\t")
+    # Remove empty lines
+    lines = [line.strip() for line in gt_text.splitlines() if line.strip()]
 
-    # If pasted with spaces instead of tabs, retry with whitespace separator
-    if not required_cols.issubset(gt_df.columns):
-        gt_df = pd.read_csv(
-            io.StringIO(gt_text),
-            sep=r"\s+",
-            engine="python",
+    if len(lines) < 2:
+        raise ValueError("GT must contain a header line and at least one data row.")
+
+    # Split header by any whitespace: tabs, one space, many spaces
+    header = lines[0].split()
+
+    rows = []
+    bad_lines = []
+
+    for line_number, line in enumerate(lines[1:], start=2):
+        parts = line.split()
+
+        if len(parts) < len(header):
+            bad_lines.append((line_number, line))
+            continue
+
+        # If there are extra fields, merge them into the last column.
+        # This protects you if source_frame or another final column accidentally has spaces.
+        if len(parts) > len(header):
+            fixed_parts = parts[: len(header) - 1]
+            fixed_parts.append(" ".join(parts[len(header) - 1 :]))
+            parts = fixed_parts
+
+        rows.append(dict(zip(header, parts)))
+
+    if not rows:
+        raise ValueError(
+            "GT was detected, but no valid data rows could be parsed. "
+            f"Header detected: {header}. "
+            f"First bad lines: {bad_lines[:3]}"
         )
+
+    gt_df = pd.DataFrame(rows)
 
     if not required_cols.issubset(gt_df.columns):
         raise ValueError(
