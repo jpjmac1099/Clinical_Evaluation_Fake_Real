@@ -138,14 +138,26 @@ def load_hidden_gt_from_secrets() -> pd.DataFrame:
     if "gt" not in st.secrets or "tsv" not in st.secrets["gt"]:
         raise RuntimeError("Missing [gt].tsv in Streamlit secrets.")
 
-    gt_tsv = st.secrets["gt"]["tsv"]
-    gt_df = pd.read_csv(io.StringIO(gt_tsv), sep="\t")
+    gt_tsv = str(st.secrets["gt"]["tsv"]).strip()
 
     required_cols = {"mixed_name", "true_label", "original_file"}
 
+    # First try normal TSV
+    gt_df = pd.read_csv(io.StringIO(gt_tsv), sep="\t")
+
+    # If the file was pasted with spaces instead of tabs, pandas sees one big column.
+    # In that case, retry using whitespace splitting.
+    if not required_cols.issubset(gt_df.columns):
+        gt_df = pd.read_csv(
+            io.StringIO(gt_tsv),
+            sep=r"\s+",
+            engine="python",
+        )
+
     if not required_cols.issubset(gt_df.columns):
         raise ValueError(
-            f"GT in secrets must contain columns: {sorted(required_cols)}"
+            "GT in secrets must contain at least these columns: "
+            f"{sorted(required_cols)}. Detected columns: {gt_df.columns.tolist()}"
         )
 
     gt_df = gt_df.copy()
@@ -179,7 +191,7 @@ def load_hidden_gt_from_secrets() -> pd.DataFrame:
         axis=1,
     )
 
-    # If method is missing, use true label
+    # If method is missing, use true_label
     gt_df["method"] = gt_df.apply(
         lambda r: r["true_label"] if str(r["method"]).strip() == "" else r["method"],
         axis=1,
