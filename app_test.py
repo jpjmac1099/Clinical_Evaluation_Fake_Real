@@ -138,18 +138,16 @@ def load_hidden_gt_from_secrets() -> pd.DataFrame:
     if "gt" not in st.secrets or "tsv" not in st.secrets["gt"]:
         raise RuntimeError("Missing [gt].tsv in Streamlit secrets.")
 
-    gt_tsv = str(st.secrets["gt"]["tsv"]).strip()
-
+    gt_text = str(st.secrets["gt"]["tsv"]).strip()
     required_cols = {"mixed_name", "true_label", "original_file"}
 
-    # First try normal TSV
-    gt_df = pd.read_csv(io.StringIO(gt_tsv), sep="\t")
+    # Try real TSV first
+    gt_df = pd.read_csv(io.StringIO(gt_text), sep="\t")
 
-    # If the file was pasted with spaces instead of tabs, pandas sees one big column.
-    # In that case, retry using whitespace splitting.
+    # If pasted with spaces instead of tabs, retry with whitespace separator
     if not required_cols.issubset(gt_df.columns):
         gt_df = pd.read_csv(
-            io.StringIO(gt_tsv),
+            io.StringIO(gt_text),
             sep=r"\s+",
             engine="python",
         )
@@ -178,12 +176,19 @@ def load_hidden_gt_from_secrets() -> pd.DataFrame:
         gt_df[col] = gt_df[col].astype(str).str.strip()
 
     gt_df["true_label"] = gt_df["true_label"].str.lower()
-    gt_df["mixed_stem"] = gt_df["mixed_name"].apply(lambda x: Path(str(x)).stem)
+
+    # Match using full mixed filename, not stem
+    gt_df["mixed_name_norm"] = (
+        gt_df["mixed_name"]
+        .astype(str)
+        .str.strip()
+        .apply(lambda x: Path(x).name)
+        .str.lower()
+    )
 
     gt_df["view_label"] = gt_df["view_label"].replace("", "unknown_view")
     gt_df["view_group"] = gt_df["view_group"].replace("", "unknown_group")
 
-    # Fix unknown_group using view_label
     gt_df["view_group"] = gt_df.apply(
         lambda r: group_from_view(r["view_label"])
         if str(r["view_group"]).strip() in ["", "unknown_group"]
@@ -191,7 +196,6 @@ def load_hidden_gt_from_secrets() -> pd.DataFrame:
         axis=1,
     )
 
-    # If method is missing, use true_label
     gt_df["method"] = gt_df.apply(
         lambda r: r["true_label"] if str(r["method"]).strip() == "" else r["method"],
         axis=1,
@@ -231,8 +235,8 @@ def load_dataset(
     rows = []
 
     for p in sorted(files):
-        stem = p.stem
-        match = gt_df[gt_df["mixed_stem"] == stem]
+        mixed_name = p.name.strip().lower()
+        match = gt_df[gt_df["mixed_name_norm"] == mixed_name]
 
         if len(match) == 0:
             continue
