@@ -544,35 +544,18 @@ def show_media(media_path: Path):
 def show_score_summary(scores: dict):
     st.subheader("Your results")
 
+    total = int(scores["total"])
+    correct = int(scores["correct"])
+    wrong = total - correct
+    accuracy = scores["overall_accuracy"] * 100
+
     c1, c2, c3 = st.columns(3)
 
-    c1.metric("Total accuracy", f"{scores['overall_accuracy'] * 100:.1f}%")
-    c2.metric("Correct", int(scores["correct"]))
-    c3.metric("Total answered", int(scores["total"]))
+    c1.metric("Total accuracy", f"{accuracy:.1f}%")
+    c2.metric("Correct", correct)
+    c3.metric("Wrong", wrong)
 
-    st.write(f"Correct: **{scores['correct']} / {scores['total']}**")
-
-    if not scores["by_view_method"].empty:
-        st.markdown("### Accuracy by view and method")
-        table = scores["by_view_method"].copy()
-        table["accuracy"] = (table["accuracy"] * 100).round(1)
-        table = table.rename(columns={"accuracy": "accuracy_%"})
-        st.dataframe(table, use_container_width=True)
-
-    if not scores["by_view"].empty:
-        st.markdown("### Accuracy by view")
-        table = scores["by_view"].copy()
-        table["accuracy"] = (table["accuracy"] * 100).round(1)
-        table = table.rename(columns={"accuracy": "accuracy_%"})
-        st.dataframe(table, use_container_width=True)
-
-    if not scores["by_method"].empty:
-        st.markdown("### Accuracy by method")
-        table = scores["by_method"].copy()
-        table["accuracy"] = (table["accuracy"] * 100).round(1)
-        table = table.rename(columns={"accuracy": "accuracy_%"})
-        st.dataframe(table, use_container_width=True)
-
+    st.write(f"You got **{correct} correct** and **{wrong} wrong** out of **{total}** samples.")
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 init_state()
