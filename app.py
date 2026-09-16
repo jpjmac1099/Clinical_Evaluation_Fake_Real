@@ -199,7 +199,7 @@ def email_results(responses: Path, scores_file: Path, scores: list[dict]) -> Non
 
 def reset_session() -> None:
     for key in ("started", "dataset", "media_dir", "reader", "modality", "order",
-                "idx", "responses", "session_id", "emailed", "notes", "temp_handle"):
+                "idx", "responses", "session_id", "emailed", "notes", "temp_handle", "finalized"):
         if key == "temp_handle" and key in st.session_state:
             st.session_state[key].cleanup()
         st.session_state.pop(key, None)
@@ -240,7 +240,7 @@ if not st.session_state.started:
             started=True, dataset=manifest, media_dir=str(media_dir),
             temp_handle=temp_handle, reader=reader.strip(), modality=modality,
             order=order, idx=0, responses=[], session_id=secrets.token_hex(12),
-            emailed=False, notes="",
+            emailed=False, notes="", finalized=False,
         ))
         st.rerun()
     st.stop()
@@ -250,7 +250,7 @@ idx = st.session_state.idx
 st.progress(idx / count if count else 0)
 st.caption(f"{st.session_state.modality} · Sample {min(idx + 1, count)} of {count}")
 
-if idx < count:
+if idx < count and not st.session_state.finalized:
     row = st.session_state.dataset.iloc[st.session_state.order[idx]]
     path = Path(st.session_state.media_dir) / str(row["file"])
     media_col, answer_col = st.columns([4, 2], gap="large")
@@ -286,9 +286,28 @@ if idx < count:
             save_responses()
             st.session_state.idx += 1
             st.rerun()
+
+    st.divider()
+    st.caption(
+        f"You can finish the experiment early. Only your {len(st.session_state.responses)} "
+        "previously submitted answers will be included; the current unanswered sample is excluded."
+    )
+    if st.button(
+        "Finish now & email current results",
+        disabled=not st.session_state.responses,
+        help="At least one submitted answer is required to calculate scores.",
+    ):
+        st.session_state.finalized = True
+        st.rerun()
     st.stop()
 
-st.success("Experiment complete. Thank you for participating.")
+if st.session_state.finalized and idx < count:
+    st.success(
+        f"You finished early: {len(st.session_state.responses)} of {count} "
+        "samples were classified. Thank you for participating."
+    )
+else:
+    st.success("Experiment complete. Thank you for participating.")
 # Optional notes can be entered before automatic email: email occurs after the
 # final answer at first completion (notes may be added and results resent manually).
 st.session_state.notes = st.text_area("Optional comments", value=st.session_state.notes)
