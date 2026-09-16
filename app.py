@@ -22,6 +22,7 @@ from __future__ import annotations
 import csv
 import io
 import logging
+import subprocess
 import secrets
 import smtplib
 import ssl
@@ -31,6 +32,7 @@ from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
 
+import imageio_ffmpeg
 import pandas as pd
 import streamlit as st
 
@@ -115,6 +117,42 @@ def unpack_verified_zip(upload, manifest: pd.DataFrame, modality: str, destinati
                         remaining -= len(chunk)
     except zipfile.BadZipFile as exc:
         raise ValueError("Invalid or corrupted ZIP file") from exc
+
+
+
+def browser_video_path(original: Path) -> Path:
+    """Transcode OpenCV mp4v MP4s to H.264 for Streamlit/browser playback.
+
+    The original uploaded file remains untouched. The converted copy is cached
+    in a separate directory for this session, so reruns do not re-encode it.
+    """
+    converted_dir = original.parent / "_browser_h264"
+    converted_dir.mkdir(parents=True, exist_ok=True)
+    converted = converted_dir / original.name
+    if converted.exists() and converted.stat().st_size > 0:
+        return converted
+
+    temp = converted_dir / f"{original.stem}.partial.mp4"
+    try:
+        command = [
+            imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error",
+            "-nostdin", "-y", "-i", str(original),
+            "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(temp),
+        ]
+        completed = subprocess.run(command, capture_output=True, text=True,
+                                   timeout=120, check=False)
+        if completed.returncode != 0 or not temp.exists() or temp.stat().st_size == 0:
+            raise RuntimeError(
+                "Video conversion failed. Check the app logs for the FFmpeg error."
+            )
+        temp.replace(converted)
+    except Exception:
+        logging.exception("Video conversion failed for %s", original.name)
+        raise
+    finally:
+        temp.unlink(missing_ok=True)
+    return converted
 
 
 def results_folder() -> Path:
@@ -258,7 +296,13 @@ if idx < count and not st.session_state.finalized:
         if st.session_state.modality == "ED images":
             st.image(str(path), width=DISPLAY_SIZE)
         else:
-            st.video(str(path), format="video/mp4", autoplay=False, loop=True, width=DISPLAY_SIZE)
+            try:
+                playback = browser_video_path(path)
+            except Exception:
+                st.error("This video could not be prepared for browser playback. Please contact the study administrator.")
+                st.stop()
+            st.video(str(playback), format="video/mp4", autoplay=False,
+                     loop=True, width=DISPLAY_SIZE)
     with answer_col:
         st.subheader("Classification")
         st.caption("Select an answer; submitted answers cannot be changed.")
