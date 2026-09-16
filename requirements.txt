@@ -1,3 +1,6 @@
-streamlit
+numpy
+opencv-python-headless
+Pillow
 pandas
-pillow
+streamlit
+imageio-ffmpeg
