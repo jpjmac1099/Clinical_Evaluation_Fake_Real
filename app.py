@@ -65,7 +65,36 @@ def save_responses():
     return path
 
 
-def send_email(path):
+def compute_scores(rows):
+    """Compute blinded-study results privately; never render the answer key."""
+    df = pd.DataFrame(rows)
+    total = len(df)
+    correct = int(df['correct'].sum()) if total else 0
+    summary = [dict(group='overall', category='all', total=total,
+                    correct=correct, accuracy=correct / total if total else 0.0)]
+    for field in ('source', 'view'):
+        for category, group in df.groupby(field):
+            n = len(group)
+            c = int(group['correct'].sum())
+            summary.append(dict(group=field, category=str(category), total=n,
+                                correct=c, accuracy=c / n if n else 0.0))
+    return summary
+
+
+def save_scores(rows):
+    destination = result_path().with_name(
+        f"scores_{st.session_state.session_id}.csv"
+    )
+    scores = compute_scores(rows)
+    with destination.open('w', newline='', encoding='utf-8') as handle:
+        writer = csv.DictWriter(handle,
+                                fieldnames=['group', 'category', 'total', 'correct', 'accuracy'])
+        writer.writeheader()
+        writer.writerows(scores)
+    return destination, scores
+
+
+def send_email(path, score_path, scores):
     smtp = st.secrets['smtp']
     msg = EmailMessage()
     msg['From'] = smtp['sender_email']
@@ -76,9 +105,12 @@ def send_email(path):
         f"Reader: {st.session_state.reader}\n"
         f"Study: {st.session_state.modality}\n"
         f"Responses: {len(st.session_state.responses)}\n"
-        'The full response CSV is attached.\n'
+        f"Overall correct: {scores[0]['correct']}/{scores[0]['total']}\n"
+        f"Overall accuracy: {scores[0]['accuracy']:.2%}\n"
+        '\nDetailed scores (by source and view) and individual responses are attached.\n'
     )
     msg.add_attachment(path.read_bytes(), maintype='text', subtype='csv', filename=path.name)
+    msg.add_attachment(score_path.read_bytes(), maintype='text', subtype='csv', filename=score_path.name)
     host, port = smtp['host'], int(smtp['port'])
     username, password = smtp['username'], smtp['password']
     if port == 465:
@@ -107,7 +139,7 @@ if not st.session_state.started:
         try:
             dataset, media_dir = get_dataset(modality)
         except Exception as exc:
-            st.error(f'Cannot load study: {exc}')
+            st.error('Study files are not configured or accessible. Please contact the study administrator.')
             st.stop()
         # Per-reader blinded permutation. Do not send truth or filenames in UI text.
         st.session_state.dataset = dataset
@@ -168,20 +200,35 @@ if i < n:
 
 st.success('You have classified all samples.')
 st.session_state.notes = st.text_area('Optional comments', value=st.session_state.notes)
+
 if st.session_state.responses:
     for row in st.session_state.responses:
         row['notes'] = st.session_state.notes
     csv_path = save_responses()
+
+    # Automatic email on first completion. Session flag prevents duplicate sends
+    # on subsequent Streamlit reruns; failures permit manual retry.
     if not st.session_state.submitted:
-        if st.button('Submit results by email', type='primary'):
-            try:
-                send_email(csv_path)
-                st.session_state.submitted = True
-                st.success('Results emailed successfully.')
-            except Exception as exc:
-                st.error(f'Email failed. Responses were saved on the server. Error: {exc}')
+        try:
+            score_path, scores = save_scores(st.session_state.responses)
+            send_email(csv_path, score_path, scores)
+        except Exception:
+            st.error('Automatic email delivery failed. Your responses were saved on the server.')
+            if st.button('Retry sending results', type='primary'):
+                try:
+                    score_path, scores = save_scores(st.session_state.responses)
+                    send_email(csv_path, score_path, scores)
+                except Exception:
+                    st.error('Retry failed. Contact the study administrator; server-side results remain saved.')
+                else:
+                    st.session_state.submitted = True
+                    st.rerun()
+        else:
+            st.session_state.submitted = True
+            st.rerun()
     else:
-        st.success('Results have been emailed.')
+        st.success('Results were emailed automatically to the study administrator.')
+
 if st.button('Start another experiment'):
     reset()
     st.rerun()
