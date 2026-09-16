@@ -35,6 +35,7 @@ import pandas as pd
 import streamlit as st
 
 APP_TITLE = "Echocardiography realism study"
+DISPLAY_SIZE = 192  # Change to 128 if you prefer smaller images and videos.
 REQUIRED = {"sample_id", "file", "view", "source", "true_label", "original_acquisition"}
 RESPONSE_COLUMNS = (
     "session_id", "reader_id", "modality", "sample_number", "sample_id",
@@ -255,9 +256,9 @@ if idx < count:
     media_col, answer_col = st.columns([4, 2], gap="large")
     with media_col:
         if st.session_state.modality == "ED images":
-            st.image(str(path), width=420)
+            st.image(str(path), width=DISPLAY_SIZE)
         else:
-            st.video(str(path), format="video/mp4", autoplay=False, loop=True)
+            st.video(str(path), format="video/mp4", autoplay=False, loop=True, width=DISPLAY_SIZE)
     with answer_col:
         st.subheader("Classification")
         st.caption("Select an answer; submitted answers cannot be changed.")
