@@ -10,8 +10,8 @@ Keep the answer-key CSV TEXT in Streamlit Secrets, NOT the GitHub repository:
 ed_labels_csv = '''sample_id,file,view,source,true_label,original_acquisition\n...'''
 video_labels_csv = '''sample_id,file,view,source,true_label,original_acquisition\n...'''
 # Optional overrides, relative to app_test.py:
-# ed_zip_path = "media/ed_images.zip"
-# video_zip_path = "media/videos.zip"
+# ed_zip_path = "ed_images.zip"
+# video_zip_path = "videos.zip"
 
 No media upload or SMTP/email is used. Scores appear only upon completion/early finish.
 """
