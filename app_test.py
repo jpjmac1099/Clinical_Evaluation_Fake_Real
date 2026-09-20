@@ -36,8 +36,8 @@ APP_TITLE = "Echocardiography realism study"
 DISPLAY_SIZE = 192
 REPOSITORY_DIR = Path(__file__).resolve().parent
 # Edit these defaults if your GitHub ZIPs are elsewhere in the repository.
-ED_ZIP_PATH = "media/ed_images.zip"
-VIDEO_ZIP_PATH = "media/videos.zip"
+ED_ZIP_PATH = "ed_images.zip"
+VIDEO_ZIP_PATH = "videos.zip"
 MAX_MEMBERS = 2000
 MAX_TOTAL_UNCOMPRESSED = 2 * 1024**3
 MAX_SINGLE_MEDIA = 100 * 1024**2
