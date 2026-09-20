@@ -1,828 +1,332 @@
+#!/usr/bin/env python3
+"""Clinician classification app: repository-hosted media ZIPs, on-page scores.
+
+Run: streamlit run app_test.py
+
+Keep media ZIPs in the GitHub repository (or set their repo-relative paths below).
+Keep the answer-key CSV TEXT in Streamlit Secrets, NOT the GitHub repository:
+
+[study]
+ed_labels_csv = '''sample_id,file,view,source,true_label,original_acquisition\n...'''
+video_labels_csv = '''sample_id,file,view,source,true_label,original_acquisition\n...'''
+# Optional overrides, relative to app_test.py:
+# ed_zip_path = "media/ed_images.zip"
+# video_zip_path = "media/videos.zip"
+
+No media upload or SMTP/email is used. Scores appear only upon completion/early finish.
+"""
 from __future__ import annotations
 
-import base64
-import random
+import csv
+import io
+import logging
 import secrets
-import smtplib
+import stat
+import subprocess
 import tempfile
 import zipfile
-from datetime import datetime
-from email.message import EmailMessage
-from pathlib import Path
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
 
+import imageio_ffmpeg
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
-from PIL import Image
+
+APP_TITLE = "Echocardiography realism study"
+DISPLAY_SIZE = 192
+REPOSITORY_DIR = Path(__file__).resolve().parent
+# Edit these defaults if your GitHub ZIPs are elsewhere in the repository.
+ED_ZIP_PATH = "media/ed_images.zip"
+VIDEO_ZIP_PATH = "media/videos.zip"
+MAX_MEMBERS = 2000
+MAX_TOTAL_UNCOMPRESSED = 2 * 1024**3
+MAX_SINGLE_MEDIA = 100 * 1024**2
+REQUIRED = {"sample_id", "file", "view", "source", "true_label", "original_acquisition"}
+RESPONSE_COLUMNS = (
+    "session_id", "reader_id", "modality", "sample_number", "sample_id", "view",
+    "prediction", "true_label", "source", "correct", "original_acquisition",
+    "timestamp_utc", "notes",
+)
+SCORE_COLUMNS = ("group", "category", "total", "correct", "accuracy")
 
 
-APP_TITLE = "Clinician Fake/Real Classification"
-RESULTS_EMAIL = "jpav.freitas@gmail.com"
-
-APP_DIR = Path(__file__).parent
-LOCAL_MIXED_ZIP = APP_DIR / "mixed.zip"
-
-RESULTS_DIR = APP_DIR / "results"
-RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-
-IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
-VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+def study_settings():
+    return st.secrets["study"]
 
 
-def init_state():
-    defaults = {
-        "dataset": None,
-        "working_dir": None,
-        "reader_id": "",
-        "reader_name": "",
-        "notes": "",
-        "seed": secrets.randbelow(10**9),
-        "started": False,
-        "current_idx": 0,
-        "responses": [],
-        "session_uid": datetime.now().strftime("%Y%m%d_%H%M%S"),
-        "setup_done": False,
-        "submitted": False,
-        "evaluation_type": "frames",
-        "detected_view_group": "unknown_group",
-        "detected_view": "unknown_view",
-        "final_scores": None,
-    }
+def media_zip_path(modality: str) -> Path:
+    setting = "ed_zip_path" if modality == "ED images" else "video_zip_path"
+    default = ED_ZIP_PATH if modality == "ED images" else VIDEO_ZIP_PATH
+    candidate = (REPOSITORY_DIR / str(study_settings().get(setting, default))).resolve()
+    if not candidate.is_relative_to(REPOSITORY_DIR):
+        raise ValueError("Media ZIP path must remain inside the GitHub repository")
+    if not candidate.is_file():
+        raise FileNotFoundError(
+            f"Repository ZIP not found: {candidate.relative_to(REPOSITORY_DIR)}. "
+            "Set the correct path in ED_ZIP_PATH / VIDEO_ZIP_PATH or [study] Secrets."
+        )
+    return candidate
 
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
+
+def load_private_manifest(modality: str) -> pd.DataFrame:
+    key = "ed_labels_csv" if modality == "ED images" else "video_labels_csv"
+    raw = str(study_settings()[key])
+    df = pd.read_csv(io.StringIO(raw), keep_default_na=False, dtype=str)
+    missing = REQUIRED - set(df.columns)
+    if missing:
+        raise ValueError(f"Private {modality} CSV is missing columns: {sorted(missing)}")
+    if df.empty or df["file"].duplicated().any() or df["sample_id"].duplicated().any():
+        raise ValueError("Manifest must be nonempty, with unique filenames and sample IDs")
+    extension = ".png" if modality == "ED images" else ".mp4"
+    for name in df["file"]:
+        if not name or Path(name).name != name or Path(name).suffix.lower() != extension:
+            raise ValueError("Manifest contains unsafe or unexpected media filename")
+    if not set(df["true_label"]).issubset({"real", "fake"}):
+        raise ValueError("true_label must be real or fake")
+    if not set(df["source"]).issubset({"stage1", "stage2", "real"}):
+        raise ValueError("source must be stage1, stage2, or real")
+    if any((src == "real") != (label == "real") for src, label in zip(df["source"], df["true_label"])):
+        raise ValueError("Manifest source/true_label mismatch")
+    return df.reset_index(drop=True)
+
+
+def inspect_zip(zip_path: Path, manifest: pd.DataFrame) -> dict[str, str]:
+    """Validate repository ZIP and map approved basenames to ZIP member names.
+
+    ZIP may contain nested directories. Only manifest-approved files are accepted.
+    No answer key is ever loaded from the repository ZIP.
+    """
+    expected = set(manifest["file"])
+    matched = {}
+    total = 0
+    try:
+        with zipfile.ZipFile(zip_path) as archive:
+            infos = archive.infolist()
+            if len(infos) > MAX_MEMBERS:
+                raise ValueError("Media ZIP contains too many entries")
+            for info in infos:
+                if info.is_dir():
+                    continue
+                path = PurePosixPath(info.filename.replace("\\", "/"))
+                if path.is_absolute() or ".." in path.parts or not path.parts:
+                    raise ValueError("Unsafe ZIP entry")
+                if stat.S_IFMT(info.external_attr >> 16) == stat.S_IFLNK:
+                    raise ValueError("ZIP symlinks are not allowed")
+                name = path.name
+                # ZIPs created on macOS sometimes contain harmless OS metadata.
+                if name == ".DS_Store" or "__MACOSX" in path.parts:
+                    continue
+                if name not in expected:
+                    raise ValueError(f"Unexpected file in ZIP: {name}")
+                if name in matched:
+                    raise ValueError(f"Duplicate filename inside ZIP: {name}")
+                if info.file_size > MAX_SINGLE_MEDIA:
+                    raise ValueError(f"Media file too large: {name}")
+                total += info.file_size
+                if total > MAX_TOTAL_UNCOMPRESSED:
+                    raise ValueError("ZIP uncompressed content exceeds configured limit")
+                matched[name] = info.filename
+    except zipfile.BadZipFile as exc:
+        raise ValueError("The repository media ZIP is invalid") from exc
+    if set(matched) != expected:
+        missing = sorted(expected - set(matched))
+        raise ValueError(f"ZIP and private manifest differ: {len(missing)} missing media; examples: {missing[:5]}")
+    return matched
+
+
+def load_media_bytes(name: str) -> bytes:
+    entry = st.session_state.zip_entries[name]
+    with zipfile.ZipFile(st.session_state.zip_path) as archive:
+        with archive.open(entry) as item:
+            data = item.read(MAX_SINGLE_MEDIA + 1)
+    if len(data) > MAX_SINGLE_MEDIA:
+        raise ValueError("Media exceeds maximum permitted size")
+    return data
+
+
+def playable_video(name: str) -> Path:
+    """Extract one video only, convert to H.264 for browser playback; cache per session."""
+    outdir = Path(st.session_state.temp_handle.name)
+    converted = outdir / (Path(name).stem + "_h264.mp4")
+    if converted.is_file() and converted.stat().st_size:
+        return converted
+    source = outdir / (Path(name).stem + "_source.mp4")
+    partial = outdir / (Path(name).stem + "_partial.mp4")
+    try:
+        source.write_bytes(load_media_bytes(name))
+        command = [
+            imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error",
+            "-nostdin", "-y", "-i", str(source), "-an", "-c:v", "libx264",
+            "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart", str(partial),
+        ]
+        done = subprocess.run(command, capture_output=True, text=True, timeout=120, check=False)
+        if done.returncode != 0 or not partial.is_file() or not partial.stat().st_size:
+            raise RuntimeError("Browser-compatible video conversion failed")
+        partial.replace(converted)
+    except Exception:
+        logging.exception("Video preparation failed: %s", name)
+        raise
+    finally:
+        source.unlink(missing_ok=True)
+        partial.unlink(missing_ok=True)
+    return converted
+
+
+def score_rows(responses: list[dict]) -> list[dict]:
+    data = pd.DataFrame(responses)
+    output = []
+    groups = [("overall", "all", data)]
+    for field in ("source", "view"):
+        groups.extend((field, name, subset) for name, subset in data.groupby(field, sort=True))
+    for group, category, subset in groups:
+        total = len(subset)
+        correct = int(subset["correct"].sum()) if total else 0
+        output.append({"group": group, "category": category, "total": total,
+                       "correct": correct, "accuracy": correct / total if total else 0.0})
+    return output
+
+
+def csv_bytes(columns, rows) -> bytes:
+    stream = io.StringIO()
+    writer = csv.DictWriter(stream, fieldnames=columns)
+    writer.writeheader()
+    writer.writerows(rows)
+    return stream.getvalue().encode("utf-8-sig")
 
 
 def reset_session():
-    st.session_state.dataset = None
-    st.session_state.working_dir = None
-    st.session_state.notes = ""
-    st.session_state.seed = secrets.randbelow(10**9)
-    st.session_state.started = False
-    st.session_state.current_idx = 0
-    st.session_state.responses = []
-    st.session_state.session_uid = datetime.now().strftime("%Y%m%d_%H%M%S")
-    st.session_state.setup_done = False
-    st.session_state.submitted = False
-    st.session_state.evaluation_type = "frames"
-    st.session_state.detected_view_group = "unknown_group"
-    st.session_state.detected_view = "unknown_view"
-    st.session_state.final_scores = None
-
-
-def detect_view_info_from_name(name: str) -> tuple[str, str]:
-    path_str = str(name).lower()
-
-    view_patterns = {
-        "A4C": ["a4c", "4ch", "4_ch", "4-ch"],
-        "A5C": ["a5c", "5ch", "5_ch", "5-ch"],
-        "A3C": ["a3c", "3ch", "3_ch", "3-ch"],
-        "A2C": ["a2c", "2ch", "2_ch", "2-ch"],
-        "PSAX": ["psax", "pssa"],
-        "PLAX": ["plax", "psla"],
-    }
-
-    view_label = "unknown_view"
-
-    for view, patterns in view_patterns.items():
-        if any(p in path_str for p in patterns):
-            view_label = view
-            break
-
-    if view_label in ["A4C", "A5C", "A3C", "A2C"]:
-        view_group = "apical"
-    elif view_label in ["PSAX", "PLAX"]:
-        view_group = "parasternal"
-    else:
-        view_group = "unknown_group"
-
-    return view_group, view_label
-
-
-def group_from_view(view_label: str) -> str:
-    view_label = str(view_label).strip().upper()
-
-    if view_label in ["A4C", "A5C", "A3C", "A2C"]:
-        return "apical"
-
-    if view_label in ["PSAX", "PLAX"]:
-        return "parasternal"
-
-    if view_label == "SUBCOSTAL":
-        return "subcostal"
-
-    return "unknown_group"
-
-
-def extract_local_zip_to_temp(zip_path: Path) -> Path:
-    if not zip_path.exists():
-        raise FileNotFoundError(f"Could not find local ZIP file: {zip_path}")
-
-    if not zip_path.is_file():
-        raise FileNotFoundError(f"Expected a ZIP file, but got: {zip_path}")
-
-    temp_dir = Path(tempfile.mkdtemp(prefix="study_local_zip_"))
-
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        zf.extractall(temp_dir)
-
-    return temp_dir
-
-
-def find_mixed_dir(base_dir: Path) -> Path:
-    mixed_dirs = [p for p in base_dir.rglob("mixed") if p.is_dir()]
-
-    if not mixed_dirs:
-        raise FileNotFoundError("Could not find a 'mixed' folder inside mixed.zip.")
-
-    return mixed_dirs[0]
-
-
-def load_hidden_gt_from_secrets() -> pd.DataFrame:
-    if "gt" not in st.secrets or "tsv" not in st.secrets["gt"]:
-        raise RuntimeError("Missing [gt].tsv in Streamlit secrets.")
-
-    gt_text = str(st.secrets["gt"]["tsv"]).strip()
-
-    expected_header = [
-        "mixed_name",
-        "true_label",
-        "original_file",
-        "method",
-        "view_group",
-        "view_label",
-        "original_patient",
-        "source_folder",
-        "source_frame",
-    ]
-
-    required_cols = {"mixed_name", "true_label", "original_file"}
-
-    tokens = gt_text.split()
-
-    if len(tokens) < len(expected_header) + 9:
-        raise ValueError("GT secret is too short or empty.")
-
-    header_start = None
-
-    for i in range(len(tokens) - len(expected_header) + 1):
-        if tokens[i : i + len(expected_header)] == expected_header:
-            header_start = i
-            break
-
-    if header_start is None:
-        raise ValueError(
-            "Could not find GT header. Expected header:\n"
-            + " ".join(expected_header)
-        )
-
-    data_tokens = tokens[header_start + len(expected_header):]
-
-    valid_exts = IMAGE_EXTS | VIDEO_EXTS
-
-    rows = []
-    i = 0
-
-    while i < len(data_tokens):
-        mixed_name = data_tokens[i]
-        suffix = Path(mixed_name).suffix.lower()
-
-        is_sample_start = (
-            mixed_name.startswith("sample_")
-            and suffix in valid_exts
-        )
-
-        if not is_sample_start:
-            i += 1
-            continue
-
-        if i + 8 >= len(data_tokens):
-            break
-
-        row = {
-            "mixed_name": data_tokens[i],
-            "true_label": data_tokens[i + 1],
-            "original_file": data_tokens[i + 2],
-            "method": data_tokens[i + 3],
-            "view_group": data_tokens[i + 4],
-            "view_label": data_tokens[i + 5],
-            "original_patient": data_tokens[i + 6],
-            "source_folder": data_tokens[i + 7],
-            "source_frame": data_tokens[i + 8],
-        }
-
-        rows.append(row)
-        i += 9
-
-    if not rows:
-        raise ValueError(
-            "GT header was found, but no sample rows were parsed. "
-            "Each row must start with sample_XXXX.png or sample_XXXX.mp4."
-        )
-
-    gt_df = pd.DataFrame(rows)
-
-    if not required_cols.issubset(gt_df.columns):
-        raise ValueError(
-            "GT in secrets must contain at least these columns: "
-            f"{sorted(required_cols)}. Detected columns: {gt_df.columns.tolist()}"
-        )
-
-    gt_df = gt_df.copy()
-
-    for col in expected_header:
-        if col not in gt_df.columns:
-            gt_df[col] = ""
-        gt_df[col] = gt_df[col].astype(str).str.strip()
-
-    gt_df["true_label"] = gt_df["true_label"].str.lower()
-
-    gt_df["mixed_name_norm"] = (
-        gt_df["mixed_name"]
-        .astype(str)
-        .str.strip()
-        .apply(lambda x: Path(x).name)
-        .str.lower()
-    )
-
-    gt_df["view_label"] = gt_df["view_label"].replace("", "unknown_view")
-    gt_df["view_group"] = gt_df["view_group"].replace("", "unknown_group")
-
-    gt_df["view_group"] = gt_df.apply(
-        lambda r: group_from_view(r["view_label"])
-        if str(r["view_group"]).strip() in ["", "unknown_group"]
-        else r["view_group"],
-        axis=1,
-    )
-
-    gt_df["method"] = gt_df.apply(
-        lambda r: r["true_label"] if str(r["method"]).strip() == "" else r["method"],
-        axis=1,
-    )
-
-    return gt_df
-
-
-def load_dataset(
-    mixed_dir: Path,
-    evaluation_type: str,
-) -> pd.DataFrame:
-    gt_df = load_hidden_gt_from_secrets()
-
-    detected_group, detected_view = detect_view_info_from_name(str(mixed_dir))
-
-    allowed_exts = IMAGE_EXTS if evaluation_type == "frames" else VIDEO_EXTS
-
-    if not mixed_dir.exists() or not mixed_dir.is_dir():
-        raise FileNotFoundError(f"Could not find extracted mixed folder: {mixed_dir}")
-
-    files = [
-        p for p in mixed_dir.iterdir()
-        if p.is_file() and p.suffix.lower() in allowed_exts
-    ]
-
-    if len(files) == 0:
-        raise RuntimeError(
-            f"No {evaluation_type} files found in {mixed_dir}. "
-            f"Expected extensions: {sorted(allowed_exts)}"
-        )
-
-    rows = []
-
-    for p in sorted(files):
-        mixed_name = p.name.strip().lower()
-        match = gt_df[gt_df["mixed_name_norm"] == mixed_name]
-
-        if len(match) == 0:
-            continue
-
-        row = match.iloc[0].copy()
-
-        row["media_path"] = str(p)
-        row["displayed_file"] = p.name
-
-        if not str(row.get("view_label", "")).strip() or row["view_label"] == "unknown_view":
-            row["view_label"] = detected_view
-
-        if not str(row.get("view_group", "")).strip() or row["view_group"] == "unknown_group":
-            row["view_group"] = group_from_view(row["view_label"])
-
-            if row["view_group"] == "unknown_group":
-                row["view_group"] = detected_group
-
-        row["label"] = row["view_label"]
-
-        rows.append(row)
-
-    if len(rows) == 0:
-        mixed_files = [p.name for p in sorted(files)]
-        gt_names = gt_df["mixed_name_norm"].astype(str).tolist()
-
-        raise RuntimeError(
-            "No matching GT entries found for files.\n\n"
-            f"First files in extracted mixed/: {mixed_files[:20]}\n\n"
-            f"First GT mixed_name values: {gt_names[:20]}\n\n"
-            f"Number of files in extracted mixed/: {len(mixed_files)}\n"
-            f"Number of rows in GT: {len(gt_df)}"
-        )
-
-    df = pd.DataFrame(rows)
-
-    rng = random.Random(int(st.session_state.seed))
-    df = df.sample(frac=1, random_state=rng.randint(0, 10**6)).reset_index(drop=True)
-
-    unique_groups = sorted(df["view_group"].dropna().unique())
-    unique_views = sorted(df["view_label"].dropna().unique())
-
-    st.session_state.detected_view_group = (
-        unique_groups[0] if len(unique_groups) == 1 else "mixed"
-    )
-
-    st.session_state.detected_view = (
-        unique_views[0] if len(unique_views) == 1 else "mixed"
-    )
-
-    return df
-
-
-def responses_to_df() -> pd.DataFrame:
-    if not st.session_state.responses:
-        return pd.DataFrame(
-            columns=[
-                "session_uid",
-                "reader_id",
-                "reader_name",
-                "evaluation_type",
-                "detected_view_group",
-                "detected_view",
-                "sample_idx",
-                "mixed_name",
-                "displayed_file",
-                "original_file",
-                "method",
-                "view_group",
-                "view_label",
-                "label",
-                "original_patient",
-                "source_folder",
-                "source_frame",
-                "prediction",
-                "timestamp",
-                "true_label",
-                "correct",
-            ]
-        )
-
-    return pd.DataFrame(st.session_state.responses)
-
-
-def save_session_csv() -> Path:
-    safe_reader = (st.session_state.reader_id or "reader").replace(" ", "_")
-    mode = st.session_state.evaluation_type
-    group = st.session_state.detected_view_group
-    view = st.session_state.detected_view
-
-    out = RESULTS_DIR / (
-        f"responses_{mode}_{group}_{view}_{safe_reader}_"
-        f"{st.session_state.session_uid}.csv"
-    )
-
-    responses_to_df().to_csv(out, index=False)
-    return out
-
-
-def compute_scores(df: pd.DataFrame) -> dict:
-    if df.empty:
-        return {
-            "overall_accuracy": 0.0,
-            "total": 0,
-            "correct": 0,
-            "by_group": pd.DataFrame(columns=["view_group", "n", "correct", "accuracy"]),
-            "by_view": pd.DataFrame(columns=["view_label", "n", "correct", "accuracy"]),
-            "by_method": pd.DataFrame(columns=["method", "n", "correct", "accuracy"]),
-            "by_view_method": pd.DataFrame(
-                columns=["view_label", "method", "n", "correct", "accuracy"]
-            ),
-        }
-
-    df = df.copy()
-    df["correct"] = df["correct"].astype(bool)
-
-    total = len(df)
-    correct = int(df["correct"].sum())
-    overall_accuracy = correct / total if total else 0.0
-
-    by_group = (
-        df.groupby("view_group", dropna=False)
-        .agg(n=("view_group", "size"), correct=("correct", "sum"))
-        .reset_index()
-    )
-    by_group["accuracy"] = by_group["correct"] / by_group["n"]
-
-    by_view = (
-        df.groupby("view_label", dropna=False)
-        .agg(n=("view_label", "size"), correct=("correct", "sum"))
-        .reset_index()
-    )
-    by_view["accuracy"] = by_view["correct"] / by_view["n"]
-
-    by_method = (
-        df.groupby("method", dropna=False)
-        .agg(n=("method", "size"), correct=("correct", "sum"))
-        .reset_index()
-    )
-    by_method["accuracy"] = by_method["correct"] / by_method["n"]
-
-    by_view_method = (
-        df.groupby(["view_label", "method"], dropna=False)
-        .agg(n=("correct", "size"), correct=("correct", "sum"))
-        .reset_index()
-    )
-    by_view_method["accuracy"] = by_view_method["correct"] / by_view_method["n"]
-
-    return {
-        "overall_accuracy": overall_accuracy,
-        "total": total,
-        "correct": correct,
-        "by_group": by_group,
-        "by_view": by_view,
-        "by_method": by_method,
-        "by_view_method": by_view_method,
-    }
-
-
-def send_email_with_csv(csv_path: Path, scores: dict):
-    smtp_host = st.secrets["smtp"]["host"]
-    smtp_port = int(st.secrets["smtp"]["port"])
-    smtp_user = st.secrets["smtp"]["username"]
-    smtp_password = st.secrets["smtp"]["password"]
-    sender_email = st.secrets["smtp"]["sender_email"]
-
-    msg = EmailMessage()
-    msg["From"] = sender_email
-    msg["To"] = RESULTS_EMAIL
-    msg["Subject"] = (
-        f"Clinician Study Results - "
-        f"{st.session_state.evaluation_type} - "
-        f"{st.session_state.detected_view_group} - "
-        f"{st.session_state.detected_view} - "
-        f"{st.session_state.reader_id} - "
-        f"{st.session_state.session_uid}"
-    )
-
-    body = (
-        f"Evaluation type: {st.session_state.evaluation_type}\n"
-        f"Detected view group: {st.session_state.detected_view_group}\n"
-        f"Detected view: {st.session_state.detected_view}\n"
-        f"Reader ID: {st.session_state.reader_id}\n"
-        f"Reader name: {st.session_state.reader_name}\n"
-        f"Session UID: {st.session_state.session_uid}\n"
-        f"Answered: {scores['total']}\n"
-        f"Correct: {scores['correct']}\n"
-        f"Accuracy: {scores['overall_accuracy']:.4f}\n"
-        f"Notes: {st.session_state.notes}\n\n"
-        f"Accuracy by group:\n"
-    )
-
-    if not scores["by_group"].empty:
-        for _, row in scores["by_group"].iterrows():
-            body += (
-                f"- {row['view_group']}: "
-                f"{int(row['correct'])}/{int(row['n'])} "
-                f"({row['accuracy']:.4f})\n"
-            )
-
-    body += "\nAccuracy by view:\n"
-
-    if not scores["by_view"].empty:
-        for _, row in scores["by_view"].iterrows():
-            body += (
-                f"- {row['view_label']}: "
-                f"{int(row['correct'])}/{int(row['n'])} "
-                f"({row['accuracy']:.4f})\n"
-            )
-
-    body += "\nAccuracy by method:\n"
-
-    if not scores["by_method"].empty:
-        for _, row in scores["by_method"].iterrows():
-            body += (
-                f"- {row['method']}: "
-                f"{int(row['correct'])}/{int(row['n'])} "
-                f"({row['accuracy']:.4f})\n"
-            )
-
-    body += "\nAccuracy by view and method:\n"
-
-    if not scores["by_view_method"].empty:
-        for _, row in scores["by_view_method"].iterrows():
-            body += (
-                f"- {row['view_label']} / {row['method']}: "
-                f"{int(row['correct'])}/{int(row['n'])} "
-                f"({row['accuracy']:.4f})\n"
-            )
-
-    msg.set_content(body)
-
-    with open(csv_path, "rb") as f:
-        csv_data = f.read()
-
-    msg.add_attachment(
-        csv_data,
-        maintype="text",
-        subtype="csv",
-        filename=csv_path.name,
-    )
-
-    with smtplib.SMTP(smtp_host, smtp_port) as server:
-        server.starttls()
-        server.login(smtp_user, smtp_password)
-        server.send_message(msg)
-
-
-def submit_results():
-    final_df = responses_to_df()
-    scores = compute_scores(final_df)
-    csv_path = save_session_csv()
-    send_email_with_csv(csv_path, scores)
-    st.session_state.submitted = True
-    st.session_state.final_scores = scores
-    return scores
-
-
-def record_answer(prediction: str):
-    df = st.session_state.dataset
-    idx = st.session_state.current_idx
-    row = df.iloc[idx]
-
-    true_label = str(row.get("true_label", "")).strip().lower()
-    correct = prediction == true_label
-
-    response = {
-        "session_uid": st.session_state.session_uid,
-        "reader_id": st.session_state.reader_id,
-        "reader_name": st.session_state.reader_name,
-        "evaluation_type": st.session_state.evaluation_type,
-        "detected_view_group": st.session_state.detected_view_group,
-        "detected_view": st.session_state.detected_view,
-        "sample_idx": idx,
-        "mixed_name": str(row.get("mixed_name", "")),
-        "displayed_file": str(row.get("displayed_file", "")),
-        "original_file": str(row.get("original_file", "")),
-        "method": str(row.get("method", "unknown")),
-        "view_group": str(row.get("view_group", st.session_state.detected_view_group)),
-        "view_label": str(row.get("view_label", st.session_state.detected_view)),
-        "label": str(row.get("label", row.get("view_label", st.session_state.detected_view))),
-        "original_patient": str(row.get("original_patient", "")),
-        "source_folder": str(row.get("source_folder", "")),
-        "source_frame": str(row.get("source_frame", "")),
-        "prediction": prediction,
-        "timestamp": datetime.now().isoformat(),
-        "true_label": true_label,
-        "correct": bool(correct),
-    }
-
-    st.session_state.responses.append(response)
-    st.session_state.current_idx += 1
-
-
-def show_media(media_path: Path):
-    display_width = 220
-    iframe_width = display_width + 30
-    iframe_height = display_width + 70
-
-    if st.session_state.evaluation_type == "frames":
-        image = Image.open(media_path)
-        st.image(image, width=display_width)
-
-    else:
-        with open(media_path, "rb") as f:
-            video_bytes = f.read()
-
-        video_base64 = base64.b64encode(video_bytes).decode()
-
-        components.html(
-            f"""
-            <html>
-            <body style="margin:0; padding:0; overflow:hidden;">
-                <video
-                    width="{display_width}"
-                    controls
-                    muted
-                    style="width:{display_width}px; height:auto; display:block;"
-                >
-                    <source src="data:video/mp4;base64,{video_base64}" type="video/mp4">
-                </video>
-            </body>
-            </html>
-            """,
-            width=iframe_width,
-            height=iframe_height,
-            scrolling=False,
-        )
-
-
-def show_score_summary(scores: dict):
-    st.subheader("Your results")
-
-    total = int(scores["total"])
-    correct = int(scores["correct"])
-    wrong = total - correct
-    accuracy = scores["overall_accuracy"] * 100
-
-    c1, c2, c3 = st.columns(3)
-
-    c1.metric("Total accuracy", f"{accuracy:.1f}%")
-    c2.metric("Correct", correct)
-    c3.metric("Wrong", wrong)
-
-    st.write(
-        f"You got **{correct} correct** and **{wrong} wrong** "
-        f"out of **{total}** samples."
-    )
+    handle = st.session_state.get("temp_handle")
+    if handle is not None:
+        handle.cleanup()
+    for name in ("started", "dataset", "zip_path", "zip_entries", "reader", "modality",
+                 "order", "idx", "responses", "session_id", "notes", "temp_handle", "finalized"):
+        st.session_state.pop(name, None)
 
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
-init_state()
-
 st.title(APP_TITLE)
-st.caption("Using mixed.zip included in the app repository.")
+st.caption("Classify each echocardiogram as real or synthetic. Your score appears at the end.")
 
-with st.sidebar:
-    st.header("Reader")
-
-    st.session_state.reader_id = st.text_input(
-        "Reader ID",
-        value=st.session_state.reader_id,
-        placeholder="reader_01",
-    )
-
-    st.session_state.reader_name = st.text_input(
-        "Reader name",
-        value=st.session_state.reader_name,
-        placeholder="Dr. Name",
-    )
-
-    st.caption(f"Automatic session seed: {st.session_state.seed}")
-    st.caption(f"Detected group: {st.session_state.detected_view_group}")
-    st.caption(f"Detected view: {st.session_state.detected_view}")
-    st.caption(f"Results destination: {RESULTS_EMAIL}")
-
-    st.markdown("---")
-
-    if st.button("Reset app"):
-        reset_session()
-        st.rerun()
-
-
-st.subheader("0. Select evaluation type")
-
-st.session_state.evaluation_type = st.radio(
-    "Evaluation type",
-    options=["frames", "videos"],
-    format_func=lambda x: "Frames evaluation" if x == "frames" else "Video evaluation",
-    horizontal=True,
-    disabled=st.session_state.setup_done,
-)
-
-
-st.subheader("1. Load local mixed ZIP")
-
-st.info(f"Using local ZIP: `{LOCAL_MIXED_ZIP}`")
-
-if not st.session_state.setup_done:
-    if st.button("Load mixed ZIP", type="primary"):
-        try:
-            temp_dir = extract_local_zip_to_temp(LOCAL_MIXED_ZIP)
-            mixed_dir = find_mixed_dir(temp_dir)
-
-            dataset = load_dataset(
-                mixed_dir=mixed_dir,
-                evaluation_type=st.session_state.evaluation_type,
-            )
-
-            st.session_state.working_dir = str(temp_dir)
-            st.session_state.dataset = dataset
-            st.session_state.setup_done = True
-
-            st.success(
-                f"Loaded {len(dataset)} samples from mixed.zip. "
-                f"Detected group: {st.session_state.detected_view_group}. "
-                f"Detected view: {st.session_state.detected_view}."
-            )
-            st.rerun()
-
-        except Exception as e:
-            st.error(f"Failed to load local mixed ZIP: {e}")
+if not st.session_state.get("started", False):
+    with st.form("setup"):
+        modality = st.radio("Choose experiment", ["ED images", "Videos"], horizontal=True)
+        reader = st.text_input("Reader ID (pseudonym)", placeholder="clinician_01")
+        start = st.form_submit_button("Start classification", type="primary")
+    if start:
+        if not reader.strip():
+            st.error("Please enter a reader ID.")
             st.stop()
-
-if not st.session_state.setup_done:
-    st.info("Choose the evaluation type, then click 'Load mixed ZIP'.")
-    st.stop()
-
-
-df = st.session_state.dataset
-n_total = len(df)
-answered = len(st.session_state.responses)
-
-top1, top2, top3 = st.columns([1, 1, 1])
-top1.metric("Total samples", n_total)
-top2.metric("Answered", answered)
-top3.metric("Remaining", n_total - answered)
-
-st.progress(answered / n_total if n_total else 0.0)
-
-if st.session_state.submitted and st.session_state.final_scores is not None:
-    show_score_summary(st.session_state.final_scores)
-    st.stop()
-
-if not st.session_state.started:
-    st.subheader("2. Start session")
-
-    if st.button(
-        "Start classification",
-        type="primary",
-        disabled=not st.session_state.reader_id.strip(),
-    ):
-        st.session_state.started = True
-        st.rerun()
-
-    st.stop()
-
-
-idx = st.session_state.current_idx
-
-if idx < n_total:
-    row = df.iloc[idx]
-    media_path = Path(row["media_path"])
-
-    left, spacer, right = st.columns([0.7, 0.1, 1.2])
-
-    with left:
-        st.subheader(f"Sample {idx + 1} / {n_total}")
-        show_media(media_path)
-
-    with right:
-        st.subheader("Classification")
-        st.write(f"Reader ID: **{st.session_state.reader_id}**")
-
-        if st.session_state.reader_name.strip():
-            st.write(f"Reader name: **{st.session_state.reader_name}**")
-
-        col_real, col_fake = st.columns(2)
-
-        with col_real:
-            if st.button("Real", use_container_width=True, type="primary"):
-                record_answer("real")
-                st.rerun()
-
-        with col_fake:
-            if st.button("Fake", use_container_width=True):
-                record_answer("fake")
-                st.rerun()
-
-        st.markdown("---")
-
-        if st.button(
-            "Submit now",
-            use_container_width=True,
-            disabled=answered == 0 or st.session_state.submitted,
-        ):
-            try:
-                scores = submit_results()
-                st.success(f"Results sent to {RESULTS_EMAIL}")
-                show_score_summary(scores)
-            except Exception as e:
-                st.error(f"Could not send email: {e}")
-
-    st.stop()
-
-
-st.success("Session complete.")
-
-st.session_state.notes = st.text_area(
-    "Optional notes",
-    value=st.session_state.notes,
-)
-
-bottom1, bottom2 = st.columns([2, 1])
-
-with bottom1:
-    if st.button(
-        "Submit",
-        type="primary",
-        use_container_width=True,
-        disabled=answered == 0 or st.session_state.submitted,
-    ):
+        handle = None
         try:
-            scores = submit_results()
-            st.success(f"Results sent to {RESULTS_EMAIL}")
-            show_score_summary(scores)
-        except Exception as e:
-            st.error(f"Could not send email: {e}")
-
-with bottom2:
-    if st.button("Start new session", use_container_width=True):
-        reset_session()
+            manifest = load_private_manifest(modality)
+            zip_path = media_zip_path(modality)
+            entries = inspect_zip(zip_path, manifest)
+            handle = tempfile.TemporaryDirectory(prefix="echoclinician_")
+        except Exception as exc:
+            if handle is not None:
+                handle.cleanup()
+            logging.exception("Study initialization failed")
+            st.error(f"Cannot start experiment: {exc}")
+            st.stop()
+        order = list(range(len(manifest)))
+        secrets.SystemRandom().shuffle(order)
+        st.session_state.update(dict(
+            started=True, dataset=manifest, zip_path=str(zip_path), zip_entries=entries,
+            temp_handle=handle, reader=reader.strip(), modality=modality, order=order,
+            idx=0, responses=[], session_id=secrets.token_hex(12),
+            notes="", finalized=False,
+        ))
         st.rerun()
+    st.stop()
+
+count = len(st.session_state.order)
+idx = st.session_state.idx
+st.progress(idx / count)
+st.caption(f"{st.session_state.modality} · {idx} of {count} answers submitted")
+
+if idx < count and not st.session_state.finalized:
+    sample = st.session_state.dataset.iloc[st.session_state.order[idx]]
+    filename = str(sample["file"])
+    media, answer = st.columns([4, 2], gap="large")
+    with media:
+        try:
+            if st.session_state.modality == "ED images":
+                st.image(load_media_bytes(filename), width=DISPLAY_SIZE)
+            else:
+                video = playable_video(filename)
+                st.video(str(video), format="video/mp4", autoplay=False,
+                         loop=True, width=DISPLAY_SIZE)
+        except Exception:
+            logging.exception("Cannot present media")
+            st.error("Unable to display this media. Please contact the study administrator.")
+            st.stop()
+    with answer:
+        st.subheader("Classification")
+        st.caption("Submitted answers cannot be changed.")
+        selected = st.radio("This sample appears to be:", ["Real", "Synthetic"],
+                            index=None, key=f"answer_{st.session_state.session_id}_{idx}")
+        if st.button("Submit answer", type="primary", disabled=selected is None):
+            prediction = "real" if selected == "Real" else "fake"
+            st.session_state.responses.append(dict(
+                session_id=st.session_state.session_id,
+                reader_id=st.session_state.reader,
+                modality=st.session_state.modality,
+                sample_number=idx + 1,
+                sample_id=str(sample["sample_id"]),
+                view=str(sample["view"]),
+                prediction=prediction,
+                true_label=str(sample["true_label"]),
+                source=str(sample["source"]),
+                correct=int(prediction == sample["true_label"]),
+                original_acquisition=str(sample["original_acquisition"]),
+                timestamp_utc=datetime.now(timezone.utc).isoformat(),
+                notes="",
+            ))
+            st.session_state.idx += 1
+            st.rerun()
+    st.divider()
+    if st.button("Finish early and show my score", disabled=not st.session_state.responses):
+        st.session_state.finalized = True
+        st.rerun()
+    st.stop()
+
+# Scores and true labels are shown only after a reader finishes or stops early.
+completed = len(st.session_state.responses)
+st.success("Experiment complete." if completed == count else
+           f"Finished early: {completed} of {count} samples classified.")
+st.session_state.notes = st.text_area("Optional comments", value=st.session_state.notes)
+for record in st.session_state.responses:
+    record["notes"] = st.session_state.notes
+
+scores = score_rows(st.session_state.responses)
+overall = scores[0]
+st.header("Your results")
+c1, c2, c3 = st.columns(3)
+c1.metric("Accuracy", f"{overall['accuracy']:.1%}")
+c2.metric("Correct answers", str(overall["correct"]))
+c3.metric("Answered", f"{overall['total']} / {count}")
+
+score_frame = pd.DataFrame(scores)
+score_frame["accuracy"] = score_frame["accuracy"].map(lambda x: f"{x:.1%}")
+st.subheader("Accuracy by source and echocardiographic view")
+st.dataframe(score_frame, hide_index=True, use_container_width=True)
+st.caption("Stage 1 and Stage 2 are both synthetic; real samples are the reference category. "
+           "Early finishes are scored only on submitted answers.")
+
+col1, col2 = st.columns(2)
+with col1:
+    st.download_button("Download my responses (CSV)",
+                       csv_bytes(RESPONSE_COLUMNS, st.session_state.responses),
+                       file_name=f"responses_{st.session_state.session_id}.csv",
+                       mime="text/csv")
+with col2:
+    st.download_button("Download my scores (CSV)",
+                       csv_bytes(SCORE_COLUMNS, scores),
+                       file_name=f"scores_{st.session_state.session_id}.csv",
+                       mime="text/csv")
+
+st.info("Results are shown here and are not emailed. Download the CSV files if you need to keep a copy.")
+if st.button("Start another experiment"):
+    reset_session()
+    st.rerun()
